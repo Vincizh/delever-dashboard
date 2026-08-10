@@ -10,8 +10,9 @@ Phase 3 adds a stateless, recompute-from-scratch analytics layer:
              Treasury basis-trade proxy gauge.
   * Part C : Three-layer page architecture (Fragility / Crowding / Amplifiers).
 
-Everything is derived from full-history API pulls each run; no committed state
-files, no workflow changes. Every fetch degrades gracefully in isolation.
+Most modules are recomputed from public source data each run.  Daily SPY
+concentration snapshots and official FRED fallback responses are committed so
+history can accumulate and a temporary source failure degrades gracefully.
 """
 
 import yfinance as yf
@@ -28,27 +29,39 @@ import time
 from math import log, sqrt, exp, pi
 from datetime import datetime, timezone
 
+import fast_metrics as fm
+
 print("Starting dashboard generation...")
 
-# --- VIX ---
-print("Fetching VIX...")
-try:
-    vix_spot   = yf.download("^VIX",   period="30d", auto_adjust=True, progress=False)["Close"]
-    vix3m_hist = yf.download("^VIX3M", period="30d", auto_adjust=True, progress=False)["Close"]
-    vix9d_hist = yf.download("^VIX9D", period="30d", auto_adjust=True, progress=False)["Close"]
-    def lv(df):
-        v = df.iloc[-1]
-        return float(v.iloc[0]) if hasattr(v, "iloc") else float(v)
-    vix_val   = lv(vix_spot)
-    vix3m_val = lv(vix3m_hist)
-    vix9d_val = lv(vix9d_hist)
-    vix_dates     = [d.strftime("%Y-%m-%d") for d in vix_spot.index]
-    vix_vals_list = [round(float(v), 2) for v in vix_spot.values.flatten()]
-except Exception as e:
-    print("VIX error:", e); sys.exit(1)
+# ---------------------------------------------------------------------------
+# Phase A/B fast-variable collection.  Each source is isolated inside the
+# collector, so a single upstream outage cannot stop the static dashboard.
+# ---------------------------------------------------------------------------
+print("Fetching Phase A/B fast variables...")
+fast = fm.fetch_fast_metrics("data/spy-concentration-history.json")
+if fast.get("errors"):
+    print("Fast-variable partial errors:", fast["errors"])
 
-vix_contango = vix3m_val > vix_val
-print("VIX={:.2f} VIX3M={:.2f} VIX9D={:.2f} contango={}".format(vix_val, vix3m_val, vix9d_val, vix_contango))
+# --- VIX term structure (official Cboe close history; date alignment required) ---
+print("Reading official Cboe VIX term structure...")
+vix_data = fast.get("vix", {})
+vix_available = bool(vix_data.get("available"))
+if vix_available:
+    vix_val = float(vix_data["spot"])
+    vix3m_val = float(vix_data["vix3m"])
+    vix9d_val = float(vix_data["vix9d"])
+    vix_dates = vix_data.get("dates", [])
+    vix_vals_list = vix_data.get("spot_history", [])
+    vix_contango = vix3m_val > vix_val
+    print("Cboe VIX={:.2f} VIX3M={:.2f} VIX9D={:.2f} contango={}".format(
+        vix_val, vix3m_val, vix9d_val, vix_contango))
+else:
+    # N/A rather than a stale/misaligned curve.  The false boolean keeps this
+    # signal out of confirmation; the UI renders an explicit gray state.
+    vix_val = vix3m_val = vix9d_val = float("nan")
+    vix_dates, vix_vals_list = [], []
+    vix_contango = False
+    print("Cboe VIX term structure unavailable:", vix_data.get("reason", "unknown"))
 
 # --- Funding ---
 print("Fetching funding rates...")
@@ -399,13 +412,10 @@ FACTOR_START = "2003-01-01"
 
 
 def fred_csv(series, start=FACTOR_START):
-    url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={}&observation_start={}".format(series, start)
-    r = requests.get(url, timeout=30)
-    df = pd.read_csv(io.StringIO(r.text))
-    df.columns = ["date", "val"]
-    df["date"] = pd.to_datetime(df["date"])
-    df["val"] = pd.to_numeric(df["val"], errors="coerce")
-    return df.dropna().set_index("date")["val"]
+    # Uses FRED live when reachable and a committed official-data cache only as
+    # a graceful fallback; returned observations still pass freshness checks in
+    # the fast-variable modules.
+    return fm.fetch_fred_series(series, start)
 
 
 def to_weekly(s):
@@ -1238,18 +1248,18 @@ print("Dealer-gamma signal: source={} positive={} amp_neg={} ({})".format(
 sig_count = sum([vix_contango, btc_pos, eth_pos, cta_covering, corr_declining])
 now_str   = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-cls_vix = "green" if vix_contango   else "red"
+cls_vix = ("green" if vix_contango else "red") if vix_available else "gray"
 cls_btc = "green" if btc_pos        else "red"
 cls_cot = "green" if cta_covering   else "red"
 cls_cor = "green" if corr_declining else "yellow"
 cls_fun = "green" if (btc_pos and eth_pos) else ("yellow" if (btc_pos or eth_pos) else "red")
 
-bdg_vix = "badge-green" if vix_contango   else "badge-red"
+bdg_vix = ("badge-green" if vix_contango else "badge-red") if vix_available else "badge-gray"
 bdg_cot = "badge-green" if cta_covering   else "badge-red"
 bdg_cor = "badge-green" if corr_declining else "badge-yellow"
 bdg_fun = "badge-green" if (btc_pos and eth_pos) else ("badge-yellow" if (btc_pos or eth_pos) else "badge-red")
 
-txt_vix = "CONTANGO ✅" if vix_contango   else "BACKWARDATION ⚠️"
+txt_vix = ("CONTANGO ✅" if vix_contango else "BACKWARDATION ⚠️") if vix_available else "STALE / DATE MISMATCH"
 txt_cot = "SHORT COVERING ✅" if cta_covering else "ADDING SHORTS ⚠️"
 txt_cor = "DECLINING ✅"      if corr_declining else "ELEVATED ⚠️"
 if btc_pos and eth_pos:
@@ -1276,10 +1286,10 @@ for lbl, ok in [("VIX Contango", vix_contango), ("BTC FR+", btc_pos),
     css = "filled" if ok else "empty"
     dots = dots + '<div class="dot ' + css + '" title="' + lbl + '"></div>'
 
-s_vdiff = "{:+.2f}".format(vix3m_val - vix_val)
-s_v9d   = "{:.1f}".format(vix9d_val)
-s_vix   = "{:.1f}".format(vix_val)
-s_v3m   = "{:.1f}".format(vix3m_val)
+s_vdiff = "{:+.2f}".format(vix3m_val - vix_val) if vix_available else "N/A"
+s_v9d   = "{:.1f}".format(vix9d_val) if vix_available else "N/A"
+s_vix   = "{:.1f}".format(vix_val) if vix_available else "N/A"
+s_v3m   = "{:.1f}".format(vix3m_val) if vix_available else "N/A"
 s_btc   = "{:+.4f}".format(btc_fr)
 s_eth   = "{:+.4f}".format(eth_fr)
 s_okx   = "{:+.4f}".format(okx_disp)
@@ -1288,10 +1298,10 @@ s_cpct  = "{:.1f}".format(cot_pct)
 s_cchg  = "{:+,}".format(cot_change)
 s_c2w   = "{:.3f}".format(avg_c2w)
 s_c1m   = "{:.3f}".format(avg_c1m)
-s_ymax  = "{:.2f}".format(max(vix9d_val, vix_val, vix3m_val) * 1.25)
-s_v9d_n = str(round(vix9d_val, 2))
-s_vix_n = str(round(vix_val,   2))
-s_v3m_n = str(round(vix3m_val, 2))
+s_ymax  = "{:.2f}".format(max(vix9d_val, vix_val, vix3m_val) * 1.25) if vix_available else "40"
+s_v9d_n = json.dumps(round(vix9d_val, 2) if vix_available else None)
+s_vix_n = json.dumps(round(vix_val,   2) if vix_available else None)
+s_v3m_n = json.dumps(round(vix3m_val, 2) if vix_available else None)
 
 j_vd = json.dumps(vix_dates)
 j_vv = json.dumps(vix_vals_list)
@@ -1362,7 +1372,7 @@ for k in lpi_order:
         vtxt = "{:.0f}".format(v)
         wpct = "{:.1f}".format(max(0.0, min(100.0, v)))
         d = factor_dir.get(k, "flat")
-        arr = ('<span style="color:' + ARROW_COL[d] + ';font-size:11px;margin-left:5px">'
+        arr = ('<span style="color:' + ARROW_COL[d] + ';font-size:12px;margin-left:5px">'
                + ARROW[d] + '</span>')
         raw_line = ('<div class="fx-raw"><b>' + LPI_RAW_TXT[k] + '</b> '
                     + '<span class="fx-unit">' + LPI_RAW_UNIT[k] + '</span></div>')
@@ -1493,7 +1503,7 @@ if quad_total:
                       + '<div class="quad-track"><div class="quad-fill" style="width:' + str(wpx)
                       + '%;background:' + qcol + '"></div></div></div>')
 else:
-    quad_html = '<div style="color:#64748b;font-size:11px">History unavailable</div>'
+    quad_html = '<div style="color:#64748b;font-size:12px">History unavailable</div>'
 
 # --- COT crowding HTML ---
 def _cot_card(m):
@@ -1567,6 +1577,143 @@ for tk in ["UST2Y", "UST5Y", "UST10Y"]:
         + '<span class="lpi-factor-val" style="color:' + basis_col + '">' + "{:.0f}".format(sc) + '</span></div>'
         + '<div class="lpi-track"><div class="lpi-fill" style="width:' + "{:.1f}".format(max(0, min(100, sc)))
         + '%;background:' + basis_col + '"></div></div></div>')
+
+# ---------------------------------------------------------------------------
+# Phase A/B fast-variable display helpers.  These components deliberately show
+# a gray stale/unavailable state instead of presenting an old observation as now.
+# ---------------------------------------------------------------------------
+FAST_SOURCES = {
+    "reserves": "https://fred.stlouisfed.org/graph/fredgraph.csv?id=WRESBAL",
+    "repo": "https://markets.newyorkfed.org/api/rp/repo/all/results/last/40.json",
+    "sofr": "https://markets.newyorkfed.org/api/rates/secured/sofr/last/15.json",
+    "iorb": "https://fred.stlouisfed.org/graph/fredgraph.csv?id=IORB",
+    "oas": "https://fred.stlouisfed.org/graph/fredgraph.csv?id=BAMLH0A0HYM2",
+    "concentration": "https://www.ssga.com/us/en/intermediary/library-content/products/fund-data/etfs/us/holdings-daily-us-en-spy.xlsx",
+    "vix": "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX3M_History.csv",
+}
+
+def _fast_fresh(metric):
+    return metric.get("freshness", {}) if isinstance(metric, dict) else {}
+
+def _fast_live(metric):
+    f = _fast_fresh(metric)
+    return bool(metric.get("available")) and not bool(f.get("stale"))
+
+def _fast_stamp(metric):
+    f = _fast_fresh(metric)
+    obs = f.get("observation_date") or metric.get("observation_date") or "unavailable"
+    fetched = f.get("fetched_at") or fast.get("fetched_at", now_str)
+    cadence = f.get("cadence", "source cadence")
+    if f.get("stale"):
+        return '<span class="fast-stale">STALE / unavailable</span><span> observation ' + obs + ' · fetched ' + fetched + '</span>'
+    return '<span class="fast-fresh">current</span><span> observation ' + obs + ' · fetched ' + fetched + ' · ' + cadence + '</span>'
+
+def _metric_details(title, definition, why, read, source, cadence, limitation, metric):
+    f = _fast_fresh(metric)
+    obs = f.get("observation_date") or metric.get("observation_date") or "unavailable"
+    fetched = f.get("fetched_at") or fast.get("fetched_at", now_str)
+    return ('<details class="metric-details"><summary>About ' + title + '</summary>'
+            + '<div><b>Definition:</b> ' + definition + '<br><b>Why it matters:</b> ' + why
+            + '<br><b>How to read:</b> ' + read
+            + '<br><b>Source:</b> <a href="' + source + '" target="_blank" rel="noopener">official public data</a>'
+            + '<br><b>Cadence:</b> ' + cadence + ' · <b>Observation:</b> ' + obs
+            + ' · <b>Fetched:</b> ' + fetched + '<br><b>Limitations:</b> ' + limitation + '</div></details>')
+
+def _fast_card(title, value, sub, metric, status="normal", details=""):
+    live = _fast_live(metric)
+    cls = "gray" if not live else status
+    shown = value if live else "—"
+    detail = sub if live else "Last observation " + (_fast_fresh(metric).get("observation_date") or "unavailable") + "; not rendered as current."
+    return ('<div class="fast-card ' + cls + '"><div class="fast-card-top"><span>' + title + '</span>'
+            + '<span class="fast-status ' + cls + '">' + (status.upper() if live else "STALE") + '</span></div>'
+            + '<div class="fast-value">' + shown + '</div><div class="fast-sub">' + detail + '</div>'
+            + '<div class="fast-stamp">' + _fast_stamp(metric) + '</div>' + details + '</div>')
+
+# Layer 1: reserves / GDP
+reserves = fast.get("reserves", {})
+res_status = reserves.get("status", "normal")
+res_value = ("{:.2f}%".format(reserves.get("ratio", 0)) if _fast_live(reserves) else "—")
+res_sub = ("{}th pctile · raw reserves ${:.2f}T (context only) · two-week persistence required".format(
+    "{:.0f}".format(reserves.get("percentile", float("nan"))) if reserves.get("percentile") == reserves.get("percentile") else "n/a",
+    reserves.get("raw_reserves_trillions", 0)) if _fast_live(reserves) else "")
+res_details = _metric_details("Reserves / GDP", "Fed reserve balances ÷ nominal GDP (GDP carried forward weekly); rolling 156-week percentile.",
+    "Scales the reserve buffer to the economy rather than relying on fixed dollar levels.",
+    "Below the 20th percentile for two weekly readings = warning; below the 10th percentile for two = elevated. Raw dollars are context only.",
+    FAST_SOURCES["reserves"], "weekly; GDP quarterly", "GDP is quarterly and carried forward; it is not a real-time estimate.", reserves)
+
+repo = fast.get("repo", {})
+repo_status = repo.get("status", "normal")
+repo_value = ("${:.1f}B".format(repo.get("seven_day", 0)) if _fast_live(repo) else "—")
+repo_sub = ("today ${:.1f}B · {} non-zero days / 7 · {}th pctile of available history".format(
+    repo.get("daily", 0), repo.get("recent_nonzero_days", 0),
+    "{:.0f}".format(repo.get("percentile", float("nan"))) if repo.get("percentile") == repo.get("percentile") else "n/a") if _fast_live(repo) else "")
+repo_details = _metric_details("NY Fed repo accepted", "Sum of accepted amounts in NY Fed repo operation results; headline is trailing seven calendar-day sum.",
+    "Use of the central-bank backstop can corroborate secured-funding pressure.",
+    "Read persistence and the operation's own trailing distribution, not a fixed dollar trigger; the daily amount remains visible for context.",
+    FAST_SOURCES["repo"], "daily", "Includes reported repo operations; operational use is confirmation, not a market-top signal by itself.", repo)
+
+sofr_tail = fast.get("sofr_tail", {})
+tail_value = ("{:.1f} bp".format(sofr_tail.get("current_bp", 0)) if _fast_live(sofr_tail) else "—")
+tail_details = _metric_details("SOFR p99 − median", "NY Fed SOFR 99th-percentile rate minus the published volume-weighted median SOFR.",
+    "Tail funding pressure can widen before the median rate moves.", "A widening delta is corroboration when it coincides with persistent SOFR–IORB pressure and repo use.",
+    FAST_SOURCES["sofr"], "daily", "A distributional funding-stress confirmation signal, not a standalone prediction.", sofr_tail)
+
+sofr_spread = fast.get("sofr_iorb", {})
+spread_status = sofr_spread.get("status", {}).get("status", "unavailable")
+spread_live = _fast_live(sofr_spread)
+spread_current = "{:+.1f} bp".format(sofr_spread.get("current_bp", 0)) if spread_live else "—"
+spread_delta = "{:+.1f} bp".format(sofr_spread.get("one_day_change_bp", 0)) if spread_live and sofr_spread.get("one_day_change_bp") is not None else "—"
+spread_med = "{:+.1f} bp".format(sofr_spread.get("filtered_5d_bp", 0)) if spread_live and sofr_spread.get("filtered_5d_bp") is not None else "—"
+spread_msg = sofr_spread.get("status", {}).get("message", "Data unavailable")
+spread_details = _metric_details("SOFR − IORB", "Daily SOFR minus the Fed's Interest on Reserve Balances, in basis points. Emphasized line is a 5-observation median of non-calendar readings.",
+    "Positive readings mean secured overnight funding trades above the administered reserve rate, which can indicate scarcity or balance-sheet pressure.",
+    "Zero/negative is normal/easier. Calendar observations do not create alerts. Watch requires three non-calendar readings ≥ +2bp; elevated is ≥ +5bp.",
+    FAST_SOURCES["sofr"], "daily", "Month/quarter ends, major corporate tax dates, and large Treasury settlement dates are marked as calendar noise; it is a confirmation signal, not a market-top predictor.", sofr_spread)
+
+# Layer 2: concentration
+conc = fast.get("concentration", {})
+conc_value = ("{:.2f}% / {:.2f}%".format(conc.get("top10", 0), conc.get("top5", 0)) if _fast_live(conc) else "—")
+conc_sub = ("Top-10 / Top-5 · {} locally archived daily snapshot(s)".format(conc.get("history_days", 0)) if _fast_live(conc) else "")
+conc_details = _metric_details("S&P 500 concentration", "Sum of the ten and five largest weights in the official SPY daily holdings file.",
+    "Concentration increases the index's dependence on a small group of securities.",
+    "Top-10 / Top-5 are observations. Percentile alerts stay disabled until the locally archived series has sufficient history.",
+    FAST_SOURCES["concentration"], "daily business day", "SPY is a practical S&P 500 proxy and the issuer only supplies its current holdings file; history begins with this pipeline.", conc)
+
+# Layer 3: OAS and AI breadth/relative strength
+oas = fast.get("oas", {})
+oas_cards = ""
+for _name in ("HY", "IG", "BBB"):
+    _m = oas.get(_name, {})
+    _value = "{:.2f}%".format(_m.get("value", 0)) if _fast_live(_m) else "—"
+    _sub = ("60d change {:+.2f} pp".format(_m.get("change60", 0)) if _fast_live(_m) else "")
+    _details = _metric_details(_name + " OAS", "ICE BofA option-adjusted spread from the listed FRED series.",
+        "Credit spread widening can confirm risk transmission beyond equities.", "Read the current spread with the 60-day change; no hard-coded current value is used.",
+        FAST_SOURCES["oas"], "daily business day", "Index-level OAS is not an AI-issuer credit spread.", _m)
+    oas_cards += _fast_card(_name + " OAS", _value, _sub, _m, "warning" if (_m.get("change60", 0) or 0) > .75 else "normal", _details)
+
+ai = fast.get("ai", {})
+ai_value = ("{:.0f}% / {:.0f}%".format(ai.get("above50", 0), ai.get("above200", 0)) if _fast_live(ai) else "—")
+ai_sub = ("above 50d / 200d MAs · {}/{} fixed constituents available".format(ai.get("constituent_count", 0), len(fm.AI_BASKET)) if _fast_live(ai) else "")
+ai_details = _metric_details("AI basket breadth", "Percent of the fixed documented basket above its 50-day and 200-day moving average.",
+    "Breadth shows whether leadership is broadening or narrowing inside the selected AI supply-chain basket.",
+    "Read 50d / 200d together with semiconductor relative strength; the basket is fixed to limit drift.",
+    "https://finance.yahoo.com/", "daily business day", "The basket is subjective and has survivorship bias; it is not an index or recommendation. SMH is used only as an ETF benchmark.", ai)
+rs_cards = ""
+for _etf, _d in ai.get("rs", {}).items():
+    _metric = {"available": ai.get("available"), "freshness": ai.get("freshness", {})}
+    _value = "{:.4f}".format(_d.get("current", 0)) if _fast_live(_metric) else "—"
+    _sub = ("60d {:+.1f}% · vs 50d {:.4f} / 200d {:.4f}".format(_d.get("change60", 0) * 100, _d.get("ma50", 0), _d.get("ma200", 0)) if _fast_live(_metric) else "")
+    _details = _metric_details(_etf + " / SPY relative strength", "Adjusted-close ratio of " + _etf + " to SPY, with 50-day and 200-day moving averages.",
+        "Shows whether semiconductor leadership is outperforming the broad market.", "A ratio below a declining 200-day average is a transmission/leadership warning, not a directional call.",
+        "https://finance.yahoo.com/", "daily business day", "ETF composition changes can create structural breaks; the ETF is a benchmark, not a basket constituent.", _metric)
+    rs_cards += _fast_card(_etf + " / SPY", _value, _sub, _metric, "normal", _details)
+
+j_sofr_spread = json.dumps({
+    "dates": sofr_spread.get("dates", []), "raw": sofr_spread.get("raw_bp", []),
+    "filtered": sofr_spread.get("filtered_bp", []), "changes": sofr_spread.get("daily_change_bp", []),
+    "flags": sofr_spread.get("calendar_flags", []), "noise": sofr_spread.get("calendar_noise", []),
+    "latest_status": spread_status.replace("-", " "),
+}, separators=(",", ":")).replace("</", "<\\/")
 
 # --- Summary strip ---
 strip_lpi = (s_lpi + " <span style=\"color:" + reg_col + "\">" + reg_dir + "</span>") if lpi_has else "N/A"
@@ -1705,17 +1852,17 @@ parts.append('body{background:#0d0f14;color:#e2e8f0;font-family:-apple-system,Bl
 parts.append('.header{background:#141720;border-bottom:1px solid #2d3748;padding:14px 20px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px}')
 parts.append('.header-left h1{font-size:16px;font-weight:700}')
 parts.append('.header-left h1 span{color:#6366f1}')
-parts.append('.header-left p{font-size:11px;color:#475569;margin-top:2px}')
-parts.append('.timestamp{font-size:11px;color:#64748b}')
+parts.append('.header-left p{font-size:12px;color:#475569;margin-top:2px}')
+parts.append('.timestamp{font-size:12px;color:#64748b}')
 parts.append('.summary-strip{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;padding:14px 20px}')
 parts.append('@media(max-width:600px){.summary-strip{grid-template-columns:1fr}}')
 parts.append('.summary-cell{background:#141720;border:1px solid #2d3748;border-radius:10px;padding:12px 16px}')
-parts.append('.summary-cell .lbl{font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:.08em}')
+parts.append('.summary-cell .lbl{font-size:12px;color:#64748b;text-transform:uppercase;letter-spacing:.08em}')
 parts.append('.summary-cell .val{font-size:26px;font-weight:800;margin-top:4px;line-height:1}')
-parts.append('.summary-cell .sub{font-size:11px;color:#94a3b8;margin-top:4px}')
+parts.append('.summary-cell .sub{font-size:12px;color:#94a3b8;margin-top:4px}')
 parts.append('.layer-header{margin:24px 20px 12px;padding-bottom:7px;border-bottom:2px solid #2d3748;font-size:15px;font-weight:800;color:#e2e8f0}')
 parts.append('.layer-header span{color:#6366f1;font-size:12px;font-weight:600}')
-parts.append('.layer-header .tf{float:right;font-size:10px;color:#475569;font-weight:500;text-transform:uppercase;letter-spacing:.06em}')
+parts.append('.layer-header .tf{float:right;font-size:12px;color:#475569;font-weight:500;text-transform:uppercase;letter-spacing:.06em}')
 parts.append('.signal-bar{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;padding:0 20px 16px}')
 parts.append('@media(max-width:900px){.signal-bar{grid-template-columns:repeat(2,1fr)}}')
 parts.append('@media(max-width:480px){.signal-bar{grid-template-columns:1fr}}')
@@ -1723,16 +1870,18 @@ parts.append('.signal-card{background:#141720;border:1px solid #2d3748;border-ra
 parts.append('.signal-card.green{border-left:3px solid #10b981}')
 parts.append('.signal-card.red{border-left:3px solid #ef4444}')
 parts.append('.signal-card.yellow{border-left:3px solid #f59e0b}')
-parts.append('.signal-label{font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:.08em;margin-bottom:5px}')
+parts.append('.signal-card.gray{border-left:3px solid #64748b}')
+parts.append('.signal-label{font-size:12px;color:#64748b;text-transform:uppercase;letter-spacing:.08em;margin-bottom:5px}')
 parts.append('.signal-value{font-size:20px;font-weight:700;margin-bottom:3px;line-height:1.2}')
 parts.append('.signal-value.green{color:#10b981}.signal-value.red{color:#ef4444}.signal-value.yellow{color:#f59e0b}')
-parts.append('.signal-sub{font-size:11px;color:#64748b;line-height:1.4}')
-parts.append('.signal-badge{display:inline-block;font-size:10px;font-weight:600;padding:3px 8px;border-radius:4px;margin-top:7px}')
+parts.append('.signal-sub{font-size:12px;color:#64748b;line-height:1.4}')
+parts.append('.signal-badge{display:inline-block;font-size:12px;font-weight:600;padding:3px 8px;border-radius:4px;margin-top:7px}')
 parts.append('.badge-green{background:rgba(16,185,129,.15);color:#10b981}')
 parts.append('.badge-red{background:rgba(239,68,68,.15);color:#ef4444}')
 parts.append('.badge-yellow{background:rgba(245,158,11,.15);color:#f59e0b}')
+parts.append('.badge-gray{background:rgba(100,116,139,.16);color:#cbd5e1}')
 parts.append('.confirm-counter{background:#141720;border:1px solid #2d3748;border-radius:8px;margin:0 20px 16px;padding:12px 16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}')
-parts.append('.confirm-label{font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.06em;white-space:nowrap}')
+parts.append('.confirm-label{font-size:12px;color:#64748b;text-transform:uppercase;letter-spacing:.06em;white-space:nowrap}')
 parts.append('.confirm-dots{display:flex;gap:6px;flex-shrink:0}')
 parts.append('.dot{width:11px;height:11px;border-radius:50%}')
 parts.append('.dot.filled{background:#10b981}.dot.empty{background:#2d3748}')
@@ -1747,45 +1896,56 @@ parts.append('.lpi-gauge.orange{border-left:3px solid #f97316}.lpi-gauge.red{bor
 parts.append('.lpi-gauge.teal{border-left:3px solid #14b8a6}')
 parts.append('.lpi-gauge-top{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:12px}')
 parts.append('.lpi-num{font-size:40px;font-weight:800;line-height:1}')
-parts.append('.lpi-scale{font-size:11px;color:#64748b}')
+parts.append('.lpi-scale{font-size:12px;color:#64748b}')
 parts.append('.lpi-status{font-size:13px;font-weight:600}')
-parts.append('.regime-badge{display:inline-block;font-size:11px;font-weight:700;padding:5px 11px;border-radius:6px;margin-left:auto}')
+parts.append('.regime-badge{display:inline-block;font-size:12px;font-weight:700;padding:5px 11px;border-radius:6px;margin-left:auto}')
 parts.append('.lpi-meter{position:relative;height:14px;border-radius:7px;background:linear-gradient(90deg,#10b981 0%,#10b981 40%,#f59e0b 40%,#f59e0b 60%,#f97316 60%,#f97316 80%,#ef4444 80%,#ef4444 100%)}')
 parts.append('.lpi-marker{position:absolute;top:-4px;width:3px;height:22px;background:#e2e8f0;border-radius:2px;box-shadow:0 0 4px rgba(0,0,0,.6);transform:translateX(-50%)}')
-parts.append('.lpi-ticks{display:flex;justify-content:space-between;font-size:9px;color:#475569;margin-top:5px}')
+parts.append('.lpi-ticks{display:flex;justify-content:space-between;font-size:12px;color:#475569;margin-top:5px}')
 parts.append('.regime-wrap{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}')
 parts.append('@media(max-width:700px){.regime-wrap{grid-template-columns:1fr}}')
 parts.append('.regime-box{background:#141720;border:1px solid #2d3748;border-radius:10px;padding:14px 16px}')
-parts.append('.regime-box .rb-title{font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px}')
+parts.append('.regime-box .rb-title{font-size:12px;color:#64748b;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px}')
 parts.append('.regime-msg{font-size:13px;font-weight:600;margin-bottom:6px}')
-parts.append('.regime-delta{font-size:11px;color:#94a3b8}')
+parts.append('.regime-delta{font-size:12px;color:#94a3b8}')
 parts.append('.mtx{display:grid;grid-template-columns:1fr 1fr;gap:6px}')
 parts.append('.mtx-cell{border-radius:7px;padding:9px 10px;min-height:52px}')
-parts.append('.mtx-top{font-size:10px;font-weight:700}')
-parts.append('.mtx-sub{font-size:10px;margin-top:3px;opacity:.85}')
+parts.append('.mtx-top{font-size:12px;font-weight:700}')
+parts.append('.mtx-sub{font-size:12px;margin-top:3px;opacity:.85}')
 parts.append('.lpi-factors{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:12px}')
 parts.append('@media(max-width:900px){.lpi-factors{grid-template-columns:repeat(2,1fr)}}')
 parts.append('@media(max-width:480px){.lpi-factors{grid-template-columns:1fr}}')
 parts.append('.lpi-factor{background:#141720;border:1px solid #2d3748;border-radius:8px;padding:12px 14px}')
 parts.append('.lpi-factor-top{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px}')
-parts.append('.lpi-factor-lbl{font-size:10px;color:#94a3b8;letter-spacing:.03em}')
+parts.append('.lpi-factor-lbl{font-size:12px;color:#94a3b8;letter-spacing:.03em}')
 parts.append('.lpi-factor-val{font-size:18px;font-weight:700}')
 parts.append('.lpi-track{height:6px;border-radius:3px;background:#0a0c10;overflow:hidden}')
 parts.append('.lpi-fill{height:100%;border-radius:3px}')
+parts.append('.fast-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:0 0 12px}')
+parts.append('@media(max-width:900px){.fast-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:560px){.fast-grid{grid-template-columns:1fr}}')
+parts.append('.fast-card{background:#141720;border:1px solid #2d3748;border-left:3px solid #10b981;border-radius:10px;padding:14px;min-width:0}')
+parts.append('.fast-card.warning{border-left-color:#f59e0b}.fast-card.elevated{border-left-color:#f97316}.fast-card.structural-watch{border-left-color:#f59e0b}.fast-card.calendar-noise{border-left-color:#94a3b8}.fast-card.gray{border-left-color:#64748b;opacity:.78}')
+parts.append('.fast-card-top{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px;font-weight:700;color:#cbd5e1;text-transform:uppercase;letter-spacing:.04em}')
+parts.append('.fast-status{font-size:12px;font-weight:700;border-radius:4px;padding:3px 6px;white-space:nowrap}.fast-status.normal{color:#10b981;background:rgba(16,185,129,.12)}.fast-status.warning,.fast-status.structural-watch{color:#f59e0b;background:rgba(245,158,11,.12)}.fast-status.elevated{color:#fb923c;background:rgba(249,115,22,.14)}.fast-status.calendar-noise,.fast-status.gray{color:#cbd5e1;background:rgba(100,116,139,.18)}')
+parts.append('.fast-value{font-size:26px;font-weight:800;line-height:1.1;color:#e2e8f0;margin:10px 0 5px;font-variant-numeric:tabular-nums lining-nums}.fast-sub{font-size:12px;color:#94a3b8;line-height:1.5}.fast-stamp{font-size:12px;color:#64748b;line-height:1.45;margin-top:10px}.fast-fresh{color:#10b981;font-weight:700;margin-right:5px}.fast-stale{color:#cbd5e1;font-weight:700;margin-right:5px}')
+parts.append('.metric-details{margin-top:10px;border-top:1px solid #2d3748;padding-top:8px;color:#94a3b8;font-size:12px;line-height:1.55}.metric-details summary{cursor:pointer;color:#cbd5e1;font-size:12px;font-weight:700}.metric-details div{margin-top:8px}.metric-details a{color:#93c5fd}.metric-details b{color:#e2e8f0}')
+parts.append('.sofr-panel{background:#141720;border:1px solid #2d3748;border-left:3px solid #6366f1;border-radius:10px;padding:16px;margin:0 0 12px}.sofr-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:12px 0}.sofr-kpi{background:#0f131b;border-radius:7px;padding:10px;min-width:0}.sofr-kpi label{display:block;color:#94a3b8;font-size:12px;text-transform:uppercase;letter-spacing:.04em}.sofr-kpi b{display:block;color:#e2e8f0;font-size:22px;line-height:1.2;margin-top:3px;font-variant-numeric:tabular-nums lining-nums}.sofr-kpi.status b{font-size:16px}@media(max-width:760px){.sofr-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:430px){.sofr-kpis{grid-template-columns:1fr}}')
+parts.append('.sofr-chart{width:100%;height:270px}.sofr-change-chart{width:100%;height:140px}.read-guide{font-size:12px;color:#cbd5e1;line-height:1.6;background:#0f131b;border-left:3px solid #64748b;border-radius:0 7px 7px 0;padding:10px 12px;margin-top:12px}')
+parts.append('.sofr-range{font-size:12px;color:#cbd5e1;border:1px solid #475569;border-radius:4px;padding:4px 7px;margin:0 2px;background:#141720}.sofr-range.active{background:#312e81;border-color:#6366f1;color:#e2e8f0}')
 parts.append('.fx-raw{font-size:12px;color:#cbd5e1;margin:-2px 0 8px}')
 parts.append('.fx-raw b{color:#e2e8f0;font-size:13px}')
-parts.append('.fx-unit{font-size:9px;color:#64748b;text-transform:uppercase;letter-spacing:.03em}')
-parts.append('.fx-chips{font-size:10px;color:#64748b;margin:8px 0 2px}')
-parts.append('.fx-chg{font-weight:700;font-size:10px}')
+parts.append('.fx-unit{font-size:12px;color:#64748b;text-transform:uppercase;letter-spacing:.03em}')
+parts.append('.fx-chips{font-size:12px;color:#64748b;margin:8px 0 2px}')
+parts.append('.fx-chg{font-weight:700;font-size:12px}')
 parts.append('.fx-spark{width:100%;height:40px;margin:2px 0}')
-parts.append('.fx-cmt{font-size:10px;color:#94a3b8;line-height:1.45;margin-top:6px}')
+parts.append('.fx-cmt{font-size:12px;color:#94a3b8;line-height:1.45;margin-top:6px}')
 parts.append('.fx-cmt-cn{color:#64748b}')
 parts.append('.regime-clock{width:100%;height:210px}')
-parts.append('.quad-title{font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin:12px 0 6px}')
+parts.append('.quad-title{font-size:12px;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin:12px 0 6px}')
 parts.append('.quad-list{display:flex;flex-direction:column;gap:5px}')
 parts.append('.quad-row{display:grid;grid-template-columns:1fr auto 78px;align-items:center;gap:8px;padding:4px 7px;border-radius:6px}')
-parts.append('.quad-lbl{font-size:11px}')
-parts.append('.quad-n{font-size:11px;color:#cbd5e1;font-weight:700;text-align:right}')
+parts.append('.quad-lbl{font-size:12px}')
+parts.append('.quad-n{font-size:12px;color:#cbd5e1;font-weight:700;text-align:right}')
 parts.append('.quad-track{height:7px;border-radius:4px;background:#0a0c10;overflow:hidden}')
 parts.append('.quad-fill{height:100%;border-radius:4px}')
 parts.append('.tail-thin{color:#f59e0b;cursor:help}')
@@ -1793,18 +1953,18 @@ parts.append('#chart-tail,#chart-stress-cal{width:100%}')
 parts.append('.tail-wrap{background:#141720;border:1px solid #2d3748;border-radius:10px;padding:14px 16px;margin-bottom:12px;overflow-x:auto}')
 parts.append('.tail-title{font-size:12px;font-weight:700;color:#e2e8f0;text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px}')
 parts.append('.tail-readout{font-size:12px;color:#cbd5e1;line-height:1.5;margin-bottom:10px;background:#0f131b;border-left:3px solid #6366f1;padding:8px 11px;border-radius:0 6px 6px 0}')
-parts.append('table.tail{width:100%;border-collapse:collapse;font-size:11px;min-width:640px}')
-parts.append('table.tail th{text-align:right;color:#64748b;font-weight:600;padding:6px 8px;border-bottom:1px solid #2d3748;font-size:10px;text-transform:uppercase;letter-spacing:.03em}')
+parts.append('table.tail{width:100%;border-collapse:collapse;font-size:12px;min-width:640px}')
+parts.append('table.tail th{text-align:right;color:#64748b;font-weight:600;padding:6px 8px;border-bottom:1px solid #2d3748;font-size:12px;text-transform:uppercase;letter-spacing:.03em}')
 parts.append('table.tail th:first-child,table.tail td:first-child{text-align:left}')
 parts.append('table.tail td{text-align:right;padding:6px 8px;border-bottom:1px solid #1a1f2b;color:#cbd5e1}')
 parts.append('table.tail tr.tail-hl td{background:rgba(99,102,241,.15);color:#e2e8f0;font-weight:700}')
-parts.append('.tail-foot{font-size:9px;color:#475569;margin-top:8px;line-height:1.5}')
-parts.append('.lpi-cal{background:#141720;border:1px solid #2d3748;border-radius:8px;padding:12px 14px;font-size:11px;color:#94a3b8;line-height:1.7}')
+parts.append('.tail-foot{font-size:12px;color:#475569;margin-top:8px;line-height:1.5}')
+parts.append('.lpi-cal{background:#141720;border:1px solid #2d3748;border-radius:8px;padding:12px 14px;font-size:12px;color:#94a3b8;line-height:1.7}')
 parts.append('.lpi-cal b{color:#e2e8f0}.lpi-cal .hot{color:#f97316}.lpi-cal .cool{color:#10b981}')
 parts.append('.cot-section{margin:0 20px 16px}')
-parts.append('.cot-fresh{font-size:10px;color:#10b981;background:rgba(16,185,129,.12);padding:4px 9px;border-radius:5px;display:inline-block;margin-bottom:10px}')
-parts.append('.cot-stale{font-size:10px;color:#f59e0b;background:rgba(245,158,11,.12);padding:4px 9px;border-radius:5px;display:inline-block;margin-bottom:10px}')
-parts.append('.cot-grouplbl{font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin:6px 0 8px}')
+parts.append('.cot-fresh{font-size:12px;color:#10b981;background:rgba(16,185,129,.12);padding:4px 9px;border-radius:5px;display:inline-block;margin-bottom:10px}')
+parts.append('.cot-stale{font-size:12px;color:#f59e0b;background:rgba(245,158,11,.12);padding:4px 9px;border-radius:5px;display:inline-block;margin-bottom:10px}')
+parts.append('.cot-grouplbl{font-size:12px;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin:6px 0 8px}')
 parts.append('.cot-cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:12px}')
 parts.append('@media(max-width:900px){.cot-cards{grid-template-columns:repeat(2,1fr)}}')
 parts.append('@media(max-width:480px){.cot-cards{grid-template-columns:1fr}}')
@@ -1815,14 +1975,14 @@ parts.append('.cot-sym{font-size:13px;font-weight:700;color:#e2e8f0}')
 parts.append('.cot-arrow{font-size:13px}')
 parts.append('.cot-net{font-size:21px;font-weight:800;line-height:1.1}')
 parts.append('.cot-net.green{color:#10b981}.cot-net.red{color:#ef4444}')
-parts.append('.cot-sub{font-size:10px;color:#64748b;margin:3px 0 7px}')
-parts.append('.cot-metrics{display:flex;gap:14px;font-size:10px;color:#94a3b8;margin-bottom:7px}')
+parts.append('.cot-sub{font-size:12px;color:#64748b;margin:3px 0 7px}')
+parts.append('.cot-metrics{display:flex;gap:14px;font-size:12px;color:#94a3b8;margin-bottom:7px}')
 parts.append('.cot-metrics b{color:#e2e8f0}')
 parts.append('.cot-track{height:5px;border-radius:3px;background:#0a0c10;overflow:hidden}')
 parts.append('.cot-fill{height:100%;border-radius:3px}')
 parts.append('.cot-chart{width:100%;height:230px;margin:8px 0 2px}')
-parts.append('.cot-chart-empty{display:flex;align-items:center;justify-content:center;color:#475569;font-size:11px}')
-parts.append('.cot-foot{font-size:9px;color:#475569;margin-top:6px}')
+parts.append('.cot-chart-empty{display:flex;align-items:center;justify-content:center;color:#475569;font-size:12px}')
+parts.append('.cot-foot{font-size:12px;color:#475569;margin-top:6px}')
 parts.append('.gex-section{margin:0 20px 16px}')
 parts.append('.gex-heading{font-size:13px;font-weight:700;color:#e2e8f0;text-transform:uppercase;letter-spacing:.05em;margin-bottom:10px}')
 parts.append('.gex-heading span{color:#6366f1}')
@@ -1834,40 +1994,40 @@ parts.append('.gex-card{background:#141720;border:1px solid #2d3748;border-radiu
 parts.append('.gex-card.green{border-left:3px solid #10b981}.gex-card.red{border-left:3px solid #ef4444}.gex-card.gray{border-left:3px solid #64748b}')
 parts.append('.gex-card-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}')
 parts.append('.gex-card-sym{font-size:14px;font-weight:700;color:#e2e8f0}')
-parts.append('.gex-fresh{font-size:9px;color:#10b981;background:rgba(16,185,129,.12);padding:2px 6px;border-radius:4px}')
-parts.append('.gex-cached{font-size:9px;color:#f59e0b}')
+parts.append('.gex-fresh{font-size:12px;color:#10b981;background:rgba(16,185,129,.12);padding:2px 6px;border-radius:4px}')
+parts.append('.gex-cached{font-size:12px;color:#f59e0b}')
 parts.append('.gex-card-val{font-size:22px;font-weight:800;line-height:1.1}')
 parts.append('.gex-card-val.green{color:#10b981}.gex-card-val.red{color:#ef4444}')
 parts.append('.gex-card-na{font-size:22px;font-weight:800;color:#64748b}')
-parts.append('.gex-card-lbl{font-size:10px;color:#64748b;margin:3px 0 8px}')
-parts.append('.gex-flip-txt{font-size:10px;color:#94a3b8;margin-bottom:5px}')
+parts.append('.gex-card-lbl{font-size:12px;color:#64748b;margin:3px 0 8px}')
+parts.append('.gex-flip-txt{font-size:12px;color:#94a3b8;margin-bottom:5px}')
 parts.append('.gex-flip-txt .green{color:#10b981}.gex-flip-txt .red{color:#ef4444}')
 parts.append('.gex-flip-track{position:relative;height:8px;border-radius:4px;background:linear-gradient(90deg,#ef4444 0%,#ef4444 48%,#334155 48%,#334155 52%,#10b981 52%,#10b981 100%)}')
 parts.append('.gex-flip-mid{position:absolute;left:50%;top:-2px;width:1px;height:12px;background:#64748b;transform:translateX(-50%)}')
 parts.append('.gex-flip-marker{position:absolute;top:-3px;width:4px;height:14px;border-radius:2px;transform:translateX(-50%)}')
 parts.append('.gex-flip-marker.green{background:#10b981}.gex-flip-marker.red{background:#ef4444}')
-parts.append('.gex-card-foot{font-size:9px;color:#475569;margin-top:7px}')
-parts.append('.gex-card-note{font-size:9px;color:#f59e0b;margin-top:4px}')
-parts.append('.gex-quota{font-size:10px;color:#64748b;background:#141720;border:1px solid #2d3748;border-radius:8px;padding:9px 13px}')
+parts.append('.gex-card-foot{font-size:12px;color:#475569;margin-top:7px}')
+parts.append('.gex-card-note{font-size:12px;color:#f59e0b;margin-top:4px}')
+parts.append('.gex-quota{font-size:12px;color:#64748b;background:#141720;border:1px solid #2d3748;border-radius:8px;padding:9px 13px}')
 parts.append('.gex-quota b{color:#94a3b8}.gex-quota .red{color:#ef4444}.gex-quota .green{color:#10b981}.gex-quota .gray{color:#64748b}')
-parts.append('.lpi-amp-badge{display:inline-block;font-size:9px;font-weight:600;color:#ef4444;background:rgba(239,68,68,.15);padding:2px 7px;border-radius:4px;margin-top:6px}')
+parts.append('.lpi-amp-badge{display:inline-block;font-size:12px;font-weight:600;color:#ef4444;background:rgba(239,68,68,.15);padding:2px 7px;border-radius:4px;margin-top:6px}')
 parts.append('.takeaway{margin:14px 20px 4px;background:#141720;border:1px solid #2d3748;border-radius:12px;padding:16px 18px}')
 parts.append('.takeaway-title{font-size:14px;font-weight:800;color:#e2e8f0;margin-bottom:3px}')
 parts.append('.takeaway-title span{color:#6366f1;font-size:12px;font-weight:600}')
-parts.append('.takeaway-ts{font-size:10px;color:#475569;margin-bottom:10px}')
+parts.append('.takeaway-ts{font-size:12px;color:#475569;margin-bottom:10px}')
 parts.append('.takeaway-body{font-size:12px;color:#cbd5e1;line-height:1.65;margin-bottom:11px}')
 parts.append('.takeaway-body div{margin-bottom:4px}')
 parts.append('.takeaway-stance{font-size:13px;font-weight:700;padding:10px 13px;border-radius:0 8px 8px 0;line-height:1.5}')
 parts.append('.takeaway-stance .tk-cn{font-weight:800;margin-left:6px}')
-parts.append('.hgex-sig{font-size:11px;color:#94a3b8;background:#141720;border:1px solid #2d3748;border-radius:8px;padding:9px 13px;margin-bottom:12px}')
+parts.append('.hgex-sig{font-size:12px;color:#94a3b8;background:#141720;border:1px solid #2d3748;border-radius:8px;padding:9px 13px;margin-bottom:12px}')
 parts.append('.hgex-sig .green{color:#10b981;font-weight:700}.hgex-sig .red{color:#ef4444;font-weight:700}.hgex-sig .gray{color:#64748b;font-weight:700}')
 parts.append('.charts-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:0 20px 16px}')
 parts.append('@media(max-width:700px){.charts-grid{grid-template-columns:1fr}}')
 parts.append('.chart-card{background:#141720;border:1px solid #2d3748;border-radius:10px;padding:14px;min-width:0}')
 parts.append('.chart-title{font-size:12px;font-weight:600;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em}')
-parts.append('.chart-subtitle{font-size:10px;color:#475569;margin:3px 0 10px;line-height:1.4}')
+parts.append('.chart-subtitle{font-size:12px;color:#475569;margin:3px 0 10px;line-height:1.4}')
 parts.append('.bottom-bar{background:#0a0c10;border-top:1px solid #1e2433;padding:10px 20px;display:flex;flex-wrap:wrap;gap:16px}')
-parts.append('.bottom-item{font-size:10px;color:#475569}.bottom-item span{color:#64748b}')
+parts.append('.bottom-item{font-size:12px;color:#475569}.bottom-item span{color:#64748b}')
 parts.append('</style></head><body>')
 
 # header
@@ -1908,6 +2068,28 @@ parts.append('<div class="layer-header">第一层 · 脆弱度 Fragility <span>L
              + '<span class="tf">weeks–months</span></div>')
 
 parts.append('<div class="lpi-section">')
+
+# Fast funding/liquidity variables are deliberately compact and sit beneath the
+# layer heading rather than in the top-level summary strip.
+parts.append('<div class="lpi-heading">Fast funding &amp; liquidity <span>public-data confirmation modules</span></div>')
+parts.append('<div class="fast-grid">'
+             + _fast_card('Reserves / GDP', res_value, res_sub, reserves, res_status, res_details)
+             + _fast_card('NY Fed repo accepted · 7d', repo_value, repo_sub, repo, repo_status, repo_details)
+             + _fast_card('SOFR p99 − median', tail_value, 'Tail-rate pressure; use with persistent spread and repo use.', sofr_tail, 'normal', tail_details)
+             + '</div>')
+
+parts.append('<div class="sofr-panel"><div class="lpi-heading">SOFR − IORB <span>calendar-filtered funding pressure</span></div>')
+parts.append('<div class="sofr-kpis">'
+             + '<div class="sofr-kpi"><label>Current spread</label><b>' + spread_current + '</b></div>'
+             + '<div class="sofr-kpi"><label>One-day change</label><b>' + spread_delta + '</b></div>'
+             + '<div class="sofr-kpi"><label>Filtered 5d median</label><b>' + spread_med + '</b></div>'
+             + '<div class="sofr-kpi status"><label>Calendar / structural</label><b>' + spread_status.replace('-', ' ') + '</b><span class="fast-sub">' + spread_msg + '</span></div>'
+             + '</div>')
+parts.append('<div class="chart-subtitle">Raw daily spread (muted) · filtered non-calendar five-observation median (emphasized) · hollow markers = calendar noise. '
+             + '<button class="sofr-range" data-range="3M">3M</button> <button class="sofr-range active" data-range="6M">6M</button> <button class="sofr-range" data-range="1Y">1Y</button> <button class="sofr-range" data-range="3Y">3Y</button></div>')
+parts.append('<div id="chart-sofr-iorb" class="sofr-chart"></div><div id="chart-sofr-change" class="sofr-change-chart"></div>')
+parts.append('<div class="read-guide"><b>Read guide.</b> Positive means secured overnight funding is trading above the Fed’s administered reserve rate, suggesting scarcity or balance-sheet pressure; negative or zero is normal/easier. Isolated calendar spikes are noise. Persistence with repo use and SOFR tail widening is confirmation. This is a stress-confirmation signal, not a market-top predictor by itself.</div>')
+parts.append(spread_details + '</div>')
 
 # gauge card with regime badge
 parts.append('<div class="lpi-gauge ' + reg_cls + '">')
@@ -1965,7 +2147,7 @@ if tail_ok:
     parts.append('</div>')
 else:
     parts.append('<div class="tail-wrap"><div class="tail-title">Conditional Tail Table</div>'
-                 '<div style="color:#64748b;font-size:11px">Unavailable (S&amp;P 500 or LPI history missing).</div></div>')
+                 '<div style="color:#64748b;font-size:12px">Unavailable (S&amp;P 500 or LPI history missing).</div></div>')
 
 # LPI history charts (52w + full reconstructed)
 parts.append('<div class="charts-grid" style="padding:0 0 12px">')
@@ -1997,6 +2179,8 @@ parts.append('</div>')  # lpi-section
 parts.append('<div class="layer-header">第二层 · 拥挤度 Crowding <span>CFTC COT positioning</span>'
              + '<span class="tf">weeks</span></div>')
 parts.append('<div class="cot-section">')
+parts.append('<div class="fast-grid">' + _fast_card('S&amp;P 500 concentration', conc_value, conc_sub, conc,
+             conc.get('status', 'normal'), conc_details) + '</div>')
 parts.append('<div class="' + fresh_cls + '">COT ' + fresh_txt + '</div>')
 
 if cot_ok:
@@ -2033,13 +2217,18 @@ parts.append('</div>')  # cot-section
 parts.append('<div class="layer-header">第三层 · 放大器与触发器 Amplifiers &amp; Triggers '
              + '<span>de-lever bottom signals + dealer gamma</span><span class="tf">hours–days</span></div>')
 
+parts.append('<div class="gex-section"><div class="gex-heading">Credit transmission &amp; AI leadership <span>fast variables · fixed basket</span></div>')
+parts.append('<div class="fast-grid">' + oas_cards + _fast_card('AI basket breadth', ai_value, ai_sub, ai, 'normal', ai_details) + rs_cards + '</div>')
+parts.append('</div>')
+
 # signal bar
 parts.append('<div class="signal-bar">')
 parts.append('<div class="signal-card ' + cls_vix + '">')
-parts.append('<div class="signal-label">&#9312; VIX Term Structure</div>')
+parts.append('<div class="signal-label">&#9312; VIX Term Structure · Cboe official</div>')
 parts.append('<div class="signal-value ' + cls_vix + '">' + s_vdiff + ' pts</div>')
 parts.append('<div class="signal-sub">VIX9D ' + s_v9d + ' &rarr; VIX ' + s_vix + ' &rarr; VIX3M ' + s_v3m + '</div>')
-parts.append('<div class="signal-badge ' + bdg_vix + '">' + txt_vix + '</div></div>')
+parts.append('<div class="signal-badge ' + bdg_vix + '">' + txt_vix + '</div><div class="fast-stamp">' + _fast_stamp(vix_data)
+             + '</div><details class="metric-details"><summary>About VIX term structure</summary><div><b>Definition:</b> Cboe official VIX9D, VIX, and VIX3M closes. The curve is used only when all three latest observations share the same date.<br><b>Why it matters:</b> Backwardation can accompany acute volatility demand.<br><b>How to read:</b> Contango is VIX3M above spot; a date mismatch or stale series is unavailable, never ratioed.<br><b>Source:</b> <a href="' + FAST_SOURCES["vix"] + '" target="_blank" rel="noopener">Cboe daily index history</a><br><b>Cadence:</b> daily business day · <b>Observation:</b> ' + (_fast_fresh(vix_data).get("observation_date") or "unavailable") + ' · <b>Fetched:</b> ' + (_fast_fresh(vix_data).get("fetched_at") or now_str) + '<br><b>Limitations:</b> a curve shape is a volatility-market condition, not a directional forecast.</div></details></div>')
 
 parts.append('<div class="signal-card ' + cls_fun + '">')
 parts.append('<div class="signal-label">&#9313; Crypto Funding (' + src_lbl + ')</div>')
@@ -2084,7 +2273,7 @@ def _hgex_card(sym):
              if res.get("cached") else '<span class="gex-fresh">live</span>')
     q.append('<div class="gex-card-head"><span class="gex-card-sym">' + sym + '</span>' + fresh + '</div>')
     q.append('<div class="gex-card-val ' + cls + '">' + _fmt_bn(ng)
-             + ' <span style="font-size:11px;color:#64748b">$bn/1%</span></div>')
+             + ' <span style="font-size:12px;color:#64748b">$bn/1%</span></div>')
     q.append('<div class="gex-card-lbl">net GEX &middot; '
              + ('positive — dealers dampen vol' if pos else 'negative — dealers amplify') + '</div>')
     if flip and spot:
@@ -2166,11 +2355,34 @@ parts.append('</div>')
 parts.append('<script>')
 parts.append('(function(){')
 parts.append('var T={paper_bgcolor:"rgba(0,0,0,0)",plot_bgcolor:"rgba(0,0,0,0)",')
-parts.append('  font:{color:"#94a3b8",size:10},')
-parts.append('  xaxis:{gridcolor:"#1e2433",zerolinecolor:"#2d3748",tickfont:{size:9},automargin:true,fixedrange:true},')
-parts.append('  yaxis:{gridcolor:"#1e2433",zerolinecolor:"#2d3748",tickfont:{size:9},automargin:true,fixedrange:true},')
+parts.append('  font:{color:"#94a3b8",size:12},')
+parts.append('  xaxis:{gridcolor:"#1e2433",zerolinecolor:"#2d3748",tickfont:{size:12},automargin:true,fixedrange:true},')
+parts.append('  yaxis:{gridcolor:"#1e2433",zerolinecolor:"#2d3748",tickfont:{size:12},automargin:true,fixedrange:true},')
 parts.append('  margin:{l:40,r:8,t:8,b:40},showlegend:false,height:190,autosize:true};')
 parts.append('var CFG={responsive:true,displayModeBar:false};')
+parts.append('var SFR=' + j_sofr_spread + ';')
+parts.append('var sfrEl=document.getElementById("chart-sofr-iorb"),sfrChEl=document.getElementById("chart-sofr-change");var sfrIds=[];')
+parts.append('if(sfrEl&&SFR.dates&&SFR.dates.length){')
+parts.append('  var noiseX=SFR.dates.filter(function(_,i){return SFR.noise[i];});var noiseY=SFR.raw.filter(function(_,i){return SFR.noise[i];});var noiseF=SFR.flags.filter(function(_,i){return SFR.noise[i];});')
+parts.append('  var rawCd=SFR.flags.map(function(v,i){var t=v||"non-calendar";return i===SFR.flags.length-1?t+" · latest: "+SFR.latest_status:t;});')
+parts.append('  var sfrShapes=[')
+parts.append('    {type:"line",xref:"paper",x0:0,x1:1,y0:0,y1:0,line:{color:"#64748b",width:1}},')
+parts.append('    {type:"line",xref:"paper",x0:0,x1:1,y0:2,y1:2,line:{color:"#f59e0b",width:1,dash:"dash"}},')
+parts.append('    {type:"line",xref:"paper",x0:0,x1:1,y0:5,y1:5,line:{color:"#f97316",width:1,dash:"dash"}}];')
+parts.append('  var sfrAnn=[{xref:"paper",x:1,y:2,text:"+2bp watch",showarrow:false,xanchor:"right",font:{color:"#f59e0b",size:12},bgcolor:"rgba(20,23,32,.8)"},{xref:"paper",x:1,y:5,text:"+5bp elevated",showarrow:false,xanchor:"right",font:{color:"#fb923c",size:12},bgcolor:"rgba(20,23,32,.8)"}];')
+parts.append('  var sfrTraces=[')
+parts.append('    {x:SFR.dates,y:SFR.raw,type:"scatter",mode:"lines",name:"Raw daily",line:{color:"#64748b",width:1},customdata:rawCd,hovertemplate:"%{x}<br>raw %{y:+.1f} bp<br>%{customdata}<extra></extra>"},')
+parts.append('    {x:SFR.dates,y:SFR.filtered,type:"scatter",mode:"lines",name:"Filtered 5d median",line:{color:"#a5b4fc",width:2.8},customdata:rawCd,hovertemplate:"%{x}<br>filtered %{y:+.1f} bp<br>%{customdata}<extra></extra>"},')
+parts.append('    {x:noiseX,y:noiseY,type:"scatter",mode:"markers",name:"Calendar noise",marker:{symbol:"circle-open",size:8,color:"#cbd5e1",line:{color:"#94a3b8",width:1.5}},customdata:noiseF,hovertemplate:"%{x}<br>calendar noise: %{customdata}<br>raw %{y:+.1f} bp<extra></extra>"}];')
+parts.append('  var sfrLayout=Object.assign({},T,{height:270,hovermode:"x unified",showlegend:true,legend:{orientation:"h",font:{size:12},y:1.15,x:0},margin:{l:46,r:12,t:30,b:36},shapes:sfrShapes,annotations:sfrAnn,xaxis:Object.assign({},T.xaxis,{type:"date"}),yaxis:Object.assign({},T.yaxis,{title:{text:"basis points",font:{size:12}},zeroline:true})});')
+parts.append('  Plotly.newPlot("chart-sofr-iorb",sfrTraces,sfrLayout,CFG);')
+parts.append('  var chColors=SFR.changes.map(function(v){return v===null?"#64748b":(v>0?"#f97316":(v<0?"#14b8a6":"#64748b"));});')
+parts.append('  var chTrace={x:SFR.dates,y:SFR.changes,type:"bar",marker:{color:chColors},customdata:rawCd,hovertemplate:"%{x}<br>daily change %{y:+.1f} bp<br>%{customdata}<extra></extra>"};')
+parts.append('  var chLayout=Object.assign({},T,{height:140,margin:{l:46,r:12,t:8,b:34},shapes:[{type:"line",xref:"paper",x0:0,x1:1,y0:0,y1:0,line:{color:"#64748b",width:1}}],xaxis:Object.assign({},T.xaxis,{type:"date"}),yaxis:Object.assign({},T.yaxis,{title:{text:"Δ bp",font:{size:12}}})});')
+parts.append('  Plotly.newPlot("chart-sofr-change",[chTrace],chLayout,CFG);sfrIds=["chart-sofr-iorb","chart-sofr-change"];')
+parts.append('  function setSfrRange(label){var last=new Date(SFR.dates[SFR.dates.length-1]+"T00:00:00Z"),months={\"3M\":3,\"6M\":6,\"1Y\":12,\"3Y\":36}[label]||6,start=new Date(last);start.setUTCMonth(start.getUTCMonth()-months);var r=[start.toISOString().slice(0,10),SFR.dates[SFR.dates.length-1]];Plotly.relayout("chart-sofr-iorb",{"xaxis.range":r});Plotly.relayout("chart-sofr-change",{"xaxis.range":r});document.querySelectorAll(".sofr-range").forEach(function(b){b.classList.toggle("active",b.dataset.range===label);});}')
+parts.append('  document.querySelectorAll(".sofr-range").forEach(function(b){b.addEventListener("click",function(){setSfrRange(b.dataset.range);});});setSfrRange("6M");')
+parts.append('}else{if(sfrEl)sfrEl.innerHTML="<div style=\\"color:#94a3b8;font-size:12px;padding:24px 0\\">SOFR–IORB history unavailable or stale; no current value shown.</div>";if(sfrChEl)sfrChEl.innerHTML="";}')
 parts.append('var vixShape={type:"line",x0:0,x1:1,xref:"paper",y0:20,y1:20,line:{color:"#ef4444",width:1,dash:"dot"}};')
 parts.append('Plotly.newPlot("chart-vix",[{x:' + j_vd + ',y:' + j_vv + ',type:"scatter",mode:"lines",')
 parts.append('  line:{color:"#f59e0b",width:2},fill:"tozeroy",fillcolor:"rgba(245,158,11,0.07)"}],')
@@ -2179,9 +2391,9 @@ parts.append('Plotly.newPlot("chart-vix-term",[{x:["VIX9D","VIX spot","VIX3M"],y
 parts.append('  type:"bar",marker:{color:["#ef4444","#f59e0b","#10b981"],line:{width:0}},')
 parts.append('  text:["' + s_v9d_n + '","' + s_vix_n + '","' + s_v3m_n + '"],textposition:"outside",textfont:{color:"#e2e8f0",size:12},')
 parts.append('  width:[0.5,0.5,0.5]}],')
-parts.append('  {paper_bgcolor:"rgba(0,0,0,0)",plot_bgcolor:"rgba(0,0,0,0)",font:{color:"#94a3b8",size:10},')
-parts.append('   xaxis:{type:"category",gridcolor:"#1e2433",tickfont:{size:11,color:"#94a3b8"},fixedrange:true},')
-parts.append('   yaxis:{gridcolor:"#1e2433",tickfont:{size:9},range:[0,' + s_ymax + '],automargin:true,fixedrange:true},')
+parts.append('  {paper_bgcolor:"rgba(0,0,0,0)",plot_bgcolor:"rgba(0,0,0,0)",font:{color:"#94a3b8",size:12},')
+parts.append('   xaxis:{type:"category",gridcolor:"#1e2433",tickfont:{size:12,color:"#94a3b8"},fixedrange:true},')
+parts.append('   yaxis:{gridcolor:"#1e2433",tickfont:{size:12},range:[0,' + s_ymax + '],automargin:true,fixedrange:true},')
 parts.append('   margin:{l:30,r:8,t:28,b:36},showlegend:false,height:190,autosize:true},CFG);')
 parts.append('var cotColors=' + j_cv + '.map(function(v){return v>=0?"#10b981":"#ef4444";});')
 parts.append('var zeroLine={type:"line",x0:0,x1:1,xref:"paper",y0:0,y1:0,line:{color:"#475569",width:1}};')
@@ -2203,27 +2415,27 @@ parts.append('  var decTraces=DEC.order.map(function(k){return {x:DEC.dates,y:DE
 parts.append('  var decSum=DEC.dates.map(function(_,i){return DEC.order.reduce(function(a,k){return a+DEC.series[k][i];},0);});')
 parts.append('  decTraces.push({x:DEC.dates,y:decSum,type:"scatter",mode:"lines",name:"LPI composite",line:{color:"#e2e8f0",width:2.2},hovertemplate:"%{x}<br>LPI %{y:.1f}<extra></extra>"});')
 parts.append('  Plotly.newPlot("chart-lpi",decTraces,')
-parts.append('    Object.assign({},T,{shapes:[zoneAmber,zoneRed,t60,t80],showlegend:true,legend:{orientation:"h",font:{size:8},y:-0.18,x:0},margin:{l:40,r:8,t:8,b:56},yaxis:Object.assign({},T.yaxis,{range:[0,100],autorange:false}),xaxis:Object.assign({},T.xaxis,{type:"date"})}),CFG);')
+parts.append('    Object.assign({},T,{shapes:[zoneAmber,zoneRed,t60,t80],showlegend:true,legend:{orientation:"h",font:{size:12},y:-0.18,x:0},margin:{l:40,r:8,t:8,b:56},yaxis:Object.assign({},T.yaxis,{range:[0,100],autorange:false}),xaxis:Object.assign({},T.xaxis,{type:"date"})}),CFG);')
 parts.append('}else if(lpiD.length){')
 parts.append('  Plotly.newPlot("chart-lpi",[{x:lpiD,y:lpiV,type:"scatter",mode:"lines",line:{color:"#6366f1",width:2},fill:"tozeroy",fillcolor:"rgba(99,102,241,0.08)"}],')
 parts.append('    Object.assign({},T,{shapes:[zoneAmber,zoneRed,t60,t80],yaxis:Object.assign({},T.yaxis,{range:[0,100]})}),CFG);')
-parts.append('}else{document.getElementById("chart-lpi").innerHTML="<div style=\\"color:#64748b;font-size:11px;padding:20px 0\\">History unavailable</div>";}')
+parts.append('}else{document.getElementById("chart-lpi").innerHTML="<div style=\\"color:#64748b;font-size:12px;padding:20px 0\\">History unavailable</div>";}')
 parts.append('var lpiFD=' + j_lpi_fd + ',lpiFV=' + j_lpi_fv + ';')
 parts.append('var STRESS3=' + j_stress_top3 + ';')
 parts.append('if(lpiFD.length){')
 parts.append('  var stressOrd=STRESS3.map(function(s,i){return i;}).sort(function(a,b){return STRESS3[a].d<STRESS3[b].d?-1:1;});')
 parts.append('  var stAy={},stAx={},stH=[-40,-78,-58],stX=[-26,2,28];')
 parts.append('  stressOrd.forEach(function(idx,rank){stAy[idx]=stH[rank%stH.length];stAx[idx]=stX[rank%stX.length];});')
-parts.append('  var stressAnn=STRESS3.map(function(s,i){return {x:s.d,xref:"x",yref:"paper",y:s.v/105,yanchor:"top",text:(s.tag?s.tag+"<br>":"")+s.d+" ("+s.v.toFixed(1)+")",showarrow:true,arrowhead:2,arrowsize:0.7,arrowcolor:"#f87171",ax:stAx[i],ay:stAy[i],font:{size:8,color:"#fca5a5"},bgcolor:"rgba(20,23,32,0.85)",bordercolor:"#7f1d1d",borderwidth:1,borderpad:2};});')
+parts.append('  var stressAnn=STRESS3.map(function(s,i){return {x:s.d,xref:"x",yref:"paper",y:s.v/105,yanchor:"top",text:(s.tag?s.tag+"<br>":"")+s.d+" ("+s.v.toFixed(1)+")",showarrow:true,arrowhead:2,arrowsize:0.7,arrowcolor:"#f87171",ax:stAx[i],ay:stAy[i],font:{size:12,color:"#fca5a5"},bgcolor:"rgba(20,23,32,0.85)",bordercolor:"#7f1d1d",borderwidth:1,borderpad:2};});')
 parts.append('  var Tf=Object.assign({},T,{height:220,margin:{l:40,r:8,t:70,b:40},shapes:[zoneAmber,zoneRed,t60,t80],annotations:stressAnn,yaxis:Object.assign({},T.yaxis,{range:[0,105],autorange:false}),')
 parts.append('    xaxis:Object.assign({},T.xaxis,{fixedrange:false,rangeselector:{buttons:[')
 parts.append('      {count:1,label:"1y",step:"year",stepmode:"backward"},')
 parts.append('      {count:3,label:"3y",step:"year",stepmode:"backward"},')
 parts.append('      {count:5,label:"5y",step:"year",stepmode:"backward"},')
-parts.append('      {step:"all",label:"all"}],font:{size:9,color:"#94a3b8"},bgcolor:"#1e2433",activecolor:"#6366f1"},')
+parts.append('      {step:"all",label:"all"}],font:{size:12,color:"#94a3b8"},bgcolor:"#1e2433",activecolor:"#6366f1"},')
 parts.append('    rangeslider:{visible:false}})});')
 parts.append('  Plotly.newPlot("chart-lpi-full",[{x:lpiFD,y:lpiFV,type:"scatter",mode:"lines",line:{color:"#8b5cf6",width:1.5},fill:"tozeroy",fillcolor:"rgba(139,92,246,0.08)"}],Tf,CFG);')
-parts.append('}else{var ef=document.getElementById("chart-lpi-full");if(ef)ef.innerHTML="<div style=\\"color:#64748b;font-size:11px;padding:20px 0\\">History unavailable</div>";}')
+parts.append('}else{var ef=document.getElementById("chart-lpi-full");if(ef)ef.innerHTML="<div style=\\"color:#64748b;font-size:12px;padding:20px 0\\">History unavailable</div>";}')
 parts.append('var gexD=' + j_gex_d + ',gexV=' + j_gex_v + ';')
 parts.append('var gexEl=document.getElementById("chart-gex-nvda");')
 parts.append('if(gexEl&&gexD.length>=2){')
@@ -2231,7 +2443,7 @@ parts.append('  var gexColors=gexV.map(function(v){return v>=0?"#10b981":"#ef444
 parts.append('  var gexZero={type:"line",x0:0,x1:1,xref:"paper",y0:0,y1:0,line:{color:"#475569",width:1}};')
 parts.append('  Plotly.newPlot("chart-gex-nvda",[{x:gexD,y:gexV,type:"scatter",mode:"lines+markers",')
 parts.append('    line:{color:"#6366f1",width:2},marker:{color:gexColors,size:5},fill:"tozeroy",fillcolor:"rgba(99,102,241,0.07)"}],')
-parts.append('    Object.assign({},T,{shapes:[gexZero],yaxis:Object.assign({},T.yaxis,{title:{text:"$M",font:{size:9}}}),xaxis:Object.assign({},T.xaxis,{tickangle:-35})}),CFG);')
+parts.append('    Object.assign({},T,{shapes:[gexZero],yaxis:Object.assign({},T.yaxis,{title:{text:"$M",font:{size:12}}}),xaxis:Object.assign({},T.xaxis,{tickangle:-35})}),CFG);')
 parts.append('}')
 parts.append('var hgS=' + j_hgex_strk + ',hgV=' + j_hgex_val + ',hgSpot=' + j_hgex_spot + ',hgFlip=' + j_hgex_flip + ';')
 parts.append('var hgEl=document.getElementById("chart-hgex-spy");')
@@ -2241,7 +2453,7 @@ parts.append('  var hgShapes=[{type:"line",x0:0,x1:1,xref:"paper",y0:0,y1:0,line
 parts.append('  if(hgSpot!==null){hgShapes.push({type:"line",x0:hgSpot,x1:hgSpot,yref:"paper",y0:0,y1:1,line:{color:"#e2e8f0",width:1,dash:"dash"}});}')
 parts.append('  if(hgFlip!==null){hgShapes.push({type:"line",x0:hgFlip,x1:hgFlip,yref:"paper",y0:0,y1:1,line:{color:"#6366f1",width:1.5}});}')
 parts.append('  Plotly.newPlot("chart-hgex-spy",[{x:hgS,y:hgV,type:"bar",marker:{color:hgColors}}],')
-parts.append('    Object.assign({},T,{shapes:hgShapes,xaxis:Object.assign({},T.xaxis,{type:"linear",tickformat:"d"}),yaxis:Object.assign({},T.yaxis,{title:{text:"$bn/1%",font:{size:9}}})}),CFG);')
+parts.append('    Object.assign({},T,{shapes:hgShapes,xaxis:Object.assign({},T.xaxis,{type:"linear",tickformat:"d"}),yaxis:Object.assign({},T.yaxis,{title:{text:"$bn/1%",font:{size:12}}})}),CFG);')
 parts.append('}')
 # Phase 5 — per-instrument COT weekly charts (diverging long/short bars,
 # bold net line, dashed percentile line on a right-hand 0-100 axis, z annotation).
@@ -2250,7 +2462,7 @@ parts.append('var cotChartIds=[];')
 parts.append('Object.keys(COTC).forEach(function(k){')
 parts.append('  var el=document.getElementById("cot-chart-"+k);if(!el)return;')
 parts.append('  var d=COTC[k];')
-parts.append('  if(!d||!d.dates||!d.dates.length){el.innerHTML="<div style=\\"color:#475569;font-size:11px;padding:20px 0\\">chart data unavailable</div>";return;}')
+parts.append('  if(!d||!d.dates||!d.dates.length){el.innerHTML="<div style=\\"color:#475569;font-size:12px;padding:20px 0\\">chart data unavailable</div>";return;}')
 parts.append('  var traces=[')
 parts.append('    {x:d.dates,y:d.long,type:"bar",name:"long",marker:{color:"rgba(16,185,129,0.42)"},hovertemplate:"%{x}<br>long %{y:,}<extra></extra>"},')
 parts.append('    {x:d.dates,y:d.short,type:"bar",name:"short",marker:{color:"rgba(239,68,68,0.42)"},hovertemplate:"%{x}<br>short %{y:,}<extra></extra>"},')
@@ -2258,15 +2470,15 @@ parts.append('    {x:d.dates,y:d.net,type:"scatter",mode:"lines",name:"net",line
 parts.append('    {x:d.dates,y:d.pctile,type:"scatter",mode:"lines",name:"pctile",yaxis:"y2",line:{color:"#f59e0b",width:1.5,dash:"dash"},hovertemplate:"%{x}<br>pctile %{y:.0f}<extra></extra>"}')
 parts.append('  ];')
 parts.append('  var ann=[];')
-parts.append('  if(d.z!==null&&d.z!==undefined){ann.push({xref:"paper",yref:"paper",x:0.02,y:0.98,xanchor:"left",yanchor:"top",text:"z "+(d.z>=0?"+":"")+d.z.toFixed(1),showarrow:false,font:{size:11,color:"#cbd5e1"},bgcolor:"rgba(20,23,32,0.72)"});}')
+parts.append('  if(d.z!==null&&d.z!==undefined){ann.push({xref:"paper",yref:"paper",x:0.02,y:0.98,xanchor:"left",yanchor:"top",text:"z "+(d.z>=0?"+":"")+d.z.toFixed(1),showarrow:false,font:{size:12,color:"#cbd5e1"},bgcolor:"rgba(20,23,32,0.72)"});}')
 parts.append('  var lastP=d.pctile.length?d.pctile[d.pctile.length-1]:null;')
-parts.append('  if(lastP!==null&&lastP!==undefined){ann.push({xref:"paper",yref:"paper",x:0.98,y:0.98,xanchor:"right",yanchor:"top",text:"pctl "+lastP.toFixed(0),showarrow:false,font:{size:10,color:"#f59e0b"}});}')
+parts.append('  if(lastP!==null&&lastP!==undefined){ann.push({xref:"paper",yref:"paper",x:0.98,y:0.98,xanchor:"right",yanchor:"top",text:"pctl "+lastP.toFixed(0),showarrow:false,font:{size:12,color:"#f59e0b"}});}')
 parts.append('  var lay=Object.assign({},T,{barmode:"relative",height:230,hovermode:"x unified",margin:{l:44,r:38,t:8,b:40},')
 parts.append('    shapes:[{type:"line",x0:0,x1:1,xref:"paper",y0:0,y1:0,line:{color:"#475569",width:1}}],')
 parts.append('    annotations:ann,')
 parts.append('    xaxis:Object.assign({},T.xaxis,{type:"date",tickangle:-30,nticks:6}),')
-parts.append('    yaxis:Object.assign({},T.yaxis,{title:{text:"contracts",font:{size:9}},zerolinecolor:"#475569"}),')
-parts.append('    yaxis2:{overlaying:"y",side:"right",range:[0,100],showgrid:false,zeroline:false,tickfont:{size:8,color:"#f59e0b"},fixedrange:true}});')
+parts.append('    yaxis:Object.assign({},T.yaxis,{title:{text:"contracts",font:{size:12}},zerolinecolor:"#475569"}),')
+parts.append('    yaxis2:{overlaying:"y",side:"right",range:[0,100],showgrid:false,zeroline:false,tickfont:{size:12,color:"#f59e0b"},fixedrange:true}});')
 parts.append('  Plotly.newPlot("cot-chart-"+k,traces,lay,CFG);')
 parts.append('  cotChartIds.push("cot-chart-"+k);')
 parts.append('});')
@@ -2298,20 +2510,20 @@ parts.append('  var trail=[];')
 parts.append('  for(var i=0;i<n-1;i++){var op=0.15+0.55*(i/(n-1));trail.push({x:[xs[i],xs[i+1]],y:[ys[i],ys[i+1]],type:"scatter",mode:"lines",line:{color:"rgba(148,163,184,"+op.toFixed(2)+")",width:1.4},hoverinfo:"skip",showlegend:false});}')
 parts.append('  trail.push({x:xs.slice(0,n-1),y:ys.slice(0,n-1),type:"scatter",mode:"markers",marker:{color:"#64748b",size:4,opacity:0.5},hovertemplate:"%{text}<br>LPI %{x:.1f} / d13 %{y:+.1f}<extra></extra>",text:CLK.slice(0,n-1).map(function(p){return p.d;}),showlegend:false});')
 parts.append('  var cur=CLK[n-1];')
-parts.append('  trail.push({x:[cur.x],y:[cur.y],type:"scatter",mode:"markers+text",marker:{color:"#e2e8f0",size:11,line:{color:"#6366f1",width:2}},text:["now"],textposition:"top center",textfont:{size:9,color:"#e2e8f0"},hovertemplate:cur.d+"<br>LPI %{x:.1f} / d13 %{y:+.1f}<extra></extra>",showlegend:false});')
+parts.append('  trail.push({x:[cur.x],y:[cur.y],type:"scatter",mode:"markers+text",marker:{color:"#e2e8f0",size:11,line:{color:"#6366f1",width:2}},text:["now"],textposition:"top center",textfont:{size:12,color:"#e2e8f0"},hovertemplate:cur.d+"<br>LPI %{x:.1f} / d13 %{y:+.1f}<extra></extra>",showlegend:false});')
 parts.append('  var qann=[')
-parts.append('    {x:30,y:ymax*0.82,text:"Inflection watch<br>拐点观察",showarrow:false,font:{size:8,color:"#f59e0b"}},')
-parts.append('    {x:82,y:ymax*0.82,text:"Danger zone<br>危险区",showarrow:false,font:{size:8,color:"#ef4444"}},')
-parts.append('    {x:30,y:-ymax*0.82,text:"Cushion thick<br>缓冲厚",showarrow:false,font:{size:8,color:"#10b981"}},')
-parts.append('    {x:82,y:-ymax*0.82,text:"Decompress<br>减压",showarrow:false,font:{size:8,color:"#14b8a6"}}];')
+parts.append('    {x:30,y:ymax*0.82,text:"Inflection watch<br>拐点观察",showarrow:false,font:{size:12,color:"#f59e0b"}},')
+parts.append('    {x:82,y:ymax*0.82,text:"Danger zone<br>危险区",showarrow:false,font:{size:12,color:"#ef4444"}},')
+parts.append('    {x:30,y:-ymax*0.82,text:"Cushion thick<br>缓冲厚",showarrow:false,font:{size:12,color:"#10b981"}},')
+parts.append('    {x:82,y:-ymax*0.82,text:"Decompress<br>减压",showarrow:false,font:{size:12,color:"#14b8a6"}}];')
 parts.append('  var clkShapes=[{type:"line",x0:60,x1:60,yref:"y",y0:-ymax,y1:ymax,line:{color:"#475569",width:1,dash:"dot"}},')
 parts.append('    {type:"line",x0:0,x1:100,xref:"x",y0:0,y1:0,line:{color:"#475569",width:1,dash:"dot"}}];')
 parts.append('  Plotly.newPlot("chart-regime-clock",trail,')
 parts.append('    Object.assign({},T,{height:210,shapes:clkShapes,annotations:qann,margin:{l:36,r:10,t:8,b:30},')
-parts.append('     xaxis:{type:"linear",range:[0,100],gridcolor:"#1e2433",zerolinecolor:"#2d3748",tickfont:{size:8},fixedrange:true,title:{text:"LPI level",font:{size:8}}},')
-parts.append('     yaxis:{type:"linear",range:[-ymax,ymax],gridcolor:"#1e2433",zerolinecolor:"#2d3748",tickfont:{size:8},fixedrange:true,title:{text:"\\u0394 13w",font:{size:8}}}}),CFG);')
+parts.append('     xaxis:{type:"linear",range:[0,100],gridcolor:"#1e2433",zerolinecolor:"#2d3748",tickfont:{size:12},fixedrange:true,title:{text:"LPI level",font:{size:12}}},')
+parts.append('     yaxis:{type:"linear",range:[-ymax,ymax],gridcolor:"#1e2433",zerolinecolor:"#2d3748",tickfont:{size:12},fixedrange:true,title:{text:"\\u0394 13w",font:{size:12}}}}),CFG);')
 parts.append('  clkIds.push("chart-regime-clock");')
-parts.append('}else if(clkEl){clkEl.innerHTML="<div style=\\"color:#64748b;font-size:11px;padding:20px 0\\">Clock unavailable</div>";}')
+parts.append('}else if(clkEl){clkEl.innerHTML="<div style=\\"color:#64748b;font-size:12px;padding:20px 0\\">Clock unavailable</div>";}')
 # Phase 6 — tail drawdown probability grouped bars with bootstrap CI error bars
 parts.append('var TC=' + j_tailchart + ';var tailIds=[];')
 parts.append('var tcEl=document.getElementById("chart-tail");')
@@ -2329,9 +2541,9 @@ parts.append('    {x:labs,y:series("p10","8"),name:"P(>10%) 8w",type:"bar",marke
 parts.append('  var tcShapes=[];')
 parts.append('  if(TC.baseline){var bl=[["p5_8","#f59e0b"],["p10_8","#ef4444"]];bl.forEach(function(p){if(TC.baseline[p[0]]!=null){tcShapes.push({type:"line",xref:"paper",x0:0,x1:1,yref:"y",y0:TC.baseline[p[0]],y1:TC.baseline[p[0]],line:{color:p[1],width:1,dash:"dot"}});}});}')
 parts.append('  Plotly.newPlot("chart-tail",tt,')
-parts.append('    Object.assign({},T,{barmode:"group",height:210,showlegend:true,legend:{orientation:"h",font:{size:8},y:-0.22,x:0},margin:{l:40,r:10,t:8,b:60},shapes:tcShapes,')
-parts.append('     xaxis:{type:"category",gridcolor:"#1e2433",tickfont:{size:9},fixedrange:true},')
-parts.append('     yaxis:Object.assign({},T.yaxis,{title:{text:"probability %",font:{size:9}}})}),CFG);')
+parts.append('    Object.assign({},T,{barmode:"group",height:210,showlegend:true,legend:{orientation:"h",font:{size:12},y:-0.22,x:0},margin:{l:40,r:10,t:8,b:60},shapes:tcShapes,')
+parts.append('     xaxis:{type:"category",gridcolor:"#1e2433",tickfont:{size:12},fixedrange:true},')
+parts.append('     yaxis:Object.assign({},T.yaxis,{title:{text:"probability %",font:{size:12}}})}),CFG);')
 parts.append('  tailIds.push("chart-tail");')
 parts.append('}')
 # Phase 6 — stress calendar timeline (Jul-Dec 2026, today cursor)
@@ -2340,19 +2552,19 @@ parts.append('var scEl=document.getElementById("chart-stress-cal");')
 parts.append('if(scEl&&SC.length){')
 parts.append('  var scTrace={x:SC.map(function(m){return m.d;}),y:SC.map(function(){return 0;}),type:"scatter",mode:"markers+text",')
 parts.append('    marker:{color:SC.map(function(m){return m.color;}),size:SC.map(function(m){return m.size;}),line:{color:"#0d0f14",width:1}},')
-parts.append('    text:SC.map(function(m){return m.label;}),textposition:"top center",textfont:{size:8,color:"#cbd5e1"},')
+parts.append('    text:SC.map(function(m){return m.label;}),textposition:"top center",textfont:{size:12,color:"#cbd5e1"},')
 parts.append('    hovertemplate:"%{x}<br>%{text}<extra></extra>"};')
 parts.append('  var scShapes=[{type:"line",xref:"x",x0:today,x1:today,yref:"paper",y0:0,y1:1,line:{color:"#e2e8f0",width:1.5,dash:"dash"}},')
 parts.append('    {type:"line",xref:"paper",x0:0,x1:1,yref:"y",y0:0,y1:0,line:{color:"#334155",width:1}}];')
-parts.append('  var scAnn=[{x:today,y:0.9,yref:"paper",text:"today",showarrow:false,font:{size:8,color:"#e2e8f0"},xanchor:"left"}];')
+parts.append('  var scAnn=[{x:today,y:0.9,yref:"paper",text:"today",showarrow:false,font:{size:12,color:"#e2e8f0"},xanchor:"left"}];')
 parts.append('  Plotly.newPlot("chart-stress-cal",[scTrace],')
 parts.append('    Object.assign({},T,{height:130,margin:{l:10,r:10,t:24,b:24},shapes:scShapes,annotations:scAnn,')
-parts.append('     xaxis:{type:"date",range:["2026-06-25","2026-12-15"],gridcolor:"#1e2433",tickformat:"%b",dtick:"M1",tickfont:{size:9},fixedrange:true},')
+parts.append('     xaxis:{type:"date",range:["2026-06-25","2026-12-15"],gridcolor:"#1e2433",tickformat:"%b",dtick:"M1",tickfont:{size:12},fixedrange:true},')
 parts.append('     yaxis:{visible:false,range:[-1,1.6],fixedrange:true,type:"linear"}}),CFG);')
 parts.append('  scIds.push("chart-stress-cal");')
 parts.append('}')
 parts.append('window.addEventListener("resize",function(){')
-parts.append('  ["chart-vix","chart-vix-term","chart-cot","chart-corr","chart-lpi","chart-lpi-full","chart-gex-nvda","chart-hgex-spy"].concat(cotChartIds).concat(sparkIds).concat(clkIds).concat(tailIds).concat(scIds).forEach(function(id){var el=document.getElementById(id);if(el)Plotly.Plots.resize(el);});')
+parts.append('  ["chart-vix","chart-vix-term","chart-cot","chart-corr","chart-lpi","chart-lpi-full","chart-gex-nvda","chart-hgex-spy"].concat(sfrIds).concat(cotChartIds).concat(sparkIds).concat(clkIds).concat(tailIds).concat(scIds).forEach(function(id){var el=document.getElementById(id);if(el)Plotly.Plots.resize(el);});')
 parts.append('});')
 parts.append('})();')
 parts.append('</script></body></html>')
