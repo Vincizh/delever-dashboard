@@ -25,10 +25,24 @@ jobs:
         run: |
           pip install yfinance requests pandas numpy openpyxl
 
+      - name: Unit tests
+        run: |
+          python -m unittest test_fast_metrics
+          python test_gex.py
+
       - name: Generate dashboard
         run: python generate_dashboard.py
         env:
           FLASHALPHA_API_KEY: ${{ secrets.FLASHALPHA_API_KEY }}
+
+      # Browser-level gate on the deployment-style static artifact: the SOFR-IORB
+      # panel must render a sized chart with visible series, current KPI values,
+      # and working range controls before anything is pushed to Pages.
+      - name: Browser regression check
+        run: |
+          npm install --no-save playwright@1.55.0
+          npx playwright install --with-deps chromium
+          node test_dashboard_browser.mjs index.html
 
       - name: Commit and push updated index.html
         run: |

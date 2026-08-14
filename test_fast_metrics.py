@@ -87,5 +87,123 @@ class FastMetricsTests(unittest.TestCase):
         self.assertAlmostEqual(float((frame["p99"] - frame["median"]).iloc[0] * 100), 8.0)
 
 
+FRB_CSV = (
+    '"Series Description","Interest rate on excess reserves (IOER rate)",'
+    '"Interest rate on required reserves (IORR rate)","Interest rate on reserve balances (IORB rate)"\r\n'
+    '"Unit:","Percent","Percent","Percent"\r\n'
+    '"Multiplier:","1","1","1"\r\n'
+    '"Currency:","NA","NA","NA"\r\n'
+    '"Unique Identifier: ","PRATES/A","PRATES/B","PRATES/C"\r\n'
+    '"Time Period","RESBME_N.D","RESBMS_N.D","RESBM_N.D"\r\n'
+    '2021-07-28,0.15,0.15,\r\n'
+    '2026-08-11,,,3.65\r\n'
+    '2026-08-12,,,3.65\r\n'
+    '2026-08-13,,,\r\n'
+)
+
+
+class SofrIorbDisplayRegressionTests(unittest.TestCase):
+    """Regressions for the production failure where the SOFR-IORB panel showed
+    no values: FRED was unreachable from CI, the committed cache froze SOFR at an
+    old date, the spread inherited that date, and every KPI collapsed to an em
+    dash while the chart kept plotting a week-old tail."""
+
+    def test_frb_policy_rates_csv_parses_iorb_and_skips_blank_rows(self):
+        s = fm.parse_frb_policy_rates_csv(FRB_CSV)
+        self.assertEqual(s.index[-1], pd.Timestamp("2026-08-12"))
+        self.assertAlmostEqual(float(s.iloc[-1]), 3.65)
+        self.assertNotIn(pd.Timestamp("2021-07-28"), s.index)  # IORB column empty
+        self.assertNotIn(pd.Timestamp("2026-08-13"), s.index)  # no value published
+
+    def test_frb_policy_rates_csv_without_iorb_column_raises(self):
+        bad = '"Series Description","Interest rate on excess reserves (IOER rate)"\r\n2026-08-12,0.15\r\n'
+        with self.assertRaises(ValueError):
+            fm.parse_frb_policy_rates_csv(bad)
+
+    def test_splice_official_prefers_live_tail_over_stale_cache(self):
+        stale = pd.Series([3.60, 3.61, 3.62],
+                          index=pd.to_datetime(["2026-08-04", "2026-08-05", "2026-08-06"]))
+        live = pd.Series([3.65, 3.66, 3.67],
+                         index=pd.to_datetime(["2026-08-06", "2026-08-11", "2026-08-12"]))
+        out = fm.splice_official(stale, live)
+        self.assertEqual(out.index[-1], pd.Timestamp("2026-08-12"))
+        self.assertAlmostEqual(float(out.loc["2026-08-06"]), 3.65)  # live wins on overlap
+        self.assertAlmostEqual(float(out.loc["2026-08-04"]), 3.60)  # history preserved
+
+    def test_splice_official_handles_missing_sources_without_inventing_data(self):
+        live = pd.Series([3.65], index=pd.to_datetime(["2026-08-12"]))
+        self.assertTrue(fm.splice_official(None, None).empty)
+        self.assertEqual(list(fm.splice_official(None, live).index), [pd.Timestamp("2026-08-12")])
+        self.assertEqual(list(fm.splice_official(live, None).index), [pd.Timestamp("2026-08-12")])
+        self.assertTrue(fm.splice_official(pd.Series(dtype=float), pd.Series(dtype=float)).empty)
+
+    def test_spread_reaches_latest_sofr_when_iorb_is_calendar_daily(self):
+        sofr_idx = pd.bdate_range("2026-07-27", "2026-08-12")
+        sofr = pd.Series([3.65] * len(sofr_idx), index=sofr_idx)
+        iorb_idx = pd.date_range("2026-07-27", "2026-08-14")  # weekends included
+        iorb = pd.Series([3.65] * len(iorb_idx), index=iorb_idx)
+        frame = fm.filtered_sofr_iorb(sofr, iorb)
+        self.assertEqual(frame.index[-1], sofr_idx[-1])
+        self.assertEqual(len(frame), len(sofr_idx))
+
+    def test_lagging_iorb_truncates_spread_and_is_reported_stale(self):
+        sofr_idx = pd.bdate_range("2026-07-27", "2026-08-12")
+        sofr = pd.Series([3.66] * len(sofr_idx), index=sofr_idx)
+        iorb_idx = pd.date_range("2026-07-27", "2026-08-06")
+        iorb = pd.Series([3.65] * len(iorb_idx), index=iorb_idx)
+        frame = fm.filtered_sofr_iorb(sofr, iorb)
+        self.assertEqual(frame.index[-1], pd.Timestamp("2026-08-06"))
+        f = fm.freshness(frame.index[-1], "daily business day", 4,
+                         datetime(2026, 8, 14, tzinfo=timezone.utc))
+        self.assertTrue(f.stale)
+
+    def test_filtered_median_stays_empty_without_enough_non_calendar_readings(self):
+        idx = pd.to_datetime(["2026-06-30", "2026-07-31", "2026-08-31"])  # all month-end
+        frame = fm.filtered_sofr_iorb(pd.Series([3.70, 3.72, 3.71], index=idx),
+                                      pd.Series([3.65, 3.65, 3.65], index=idx))
+        self.assertTrue(frame["calendar_noise"].all())
+        self.assertTrue(frame["filtered_5d_bp"].isna().all())
+
+    def _payload(self, obs, stale, current=1.5, change=-0.5, median=-1.0):
+        return {"dates": ["2026-08-05", obs], "current_bp": current,
+                "one_day_change_bp": change, "filtered_5d_bp": median,
+                "observation_date": obs,
+                "status": {"status": "calendar-noise", "message": "Likely calendar-related: month-end"},
+                "freshness": {"observation_date": obs, "stale": stale, "age_days": 8 if stale else 1}}
+
+    def test_kpi_view_renders_real_values_when_series_is_fresh(self):
+        v = fm.sofr_kpi_view(self._payload("2026-08-12", False))
+        self.assertEqual(v["state"], "live")
+        self.assertEqual(v["current"], "+1.5 bp")
+        self.assertEqual(v["change"], "-0.5 bp")
+        self.assertEqual(v["median"], "-1.0 bp")
+        self.assertEqual(v["status_label"], "calendar noise")
+        self.assertEqual(v["note"], "")
+
+    def test_kpi_view_never_blanks_a_stale_observation(self):
+        v = fm.sofr_kpi_view(self._payload("2026-08-06", True))
+        self.assertEqual(v["state"], "stale")
+        for key in ("current", "change", "median"):
+            self.assertNotEqual(v[key], "\u2014", key + " collapsed to an em dash")
+        self.assertEqual(v["status_label"], "stale data")
+        self.assertIn("2026-08-06", v["message"])
+        self.assertIn("2026-08-06", v["note"])
+
+    def test_kpi_view_reports_unavailable_without_fabricating_numbers(self):
+        v = fm.sofr_kpi_view({"available": False, "freshness": {"observation_date": None, "stale": True}})
+        self.assertEqual(v["state"], "unavailable")
+        self.assertEqual([v["current"], v["change"], v["median"]], ["\u2014", "\u2014", "\u2014"])
+        self.assertEqual(v["status_label"], "unavailable")
+
+    def test_kpi_view_keeps_missing_single_fields_as_dashes(self):
+        payload = self._payload("2026-08-12", False)
+        payload["one_day_change_bp"] = None
+        payload["filtered_5d_bp"] = None
+        v = fm.sofr_kpi_view(payload)
+        self.assertEqual(v["current"], "+1.5 bp")
+        self.assertEqual(v["change"], "\u2014")
+        self.assertEqual(v["median"], "\u2014")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

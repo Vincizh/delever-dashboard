@@ -1659,12 +1659,20 @@ tail_details = _metric_details("SOFR p99 − median", "NY Fed SOFR 99th-percenti
     FAST_SOURCES["sofr"], "daily", "A distributional funding-stress confirmation signal, not a standalone prediction.", sofr_tail)
 
 sofr_spread = fast.get("sofr_iorb", {})
-spread_status = sofr_spread.get("status", {}).get("status", "unavailable")
-spread_live = _fast_live(sofr_spread)
-spread_current = "{:+.1f} bp".format(sofr_spread.get("current_bp", 0)) if spread_live else "—"
-spread_delta = "{:+.1f} bp".format(sofr_spread.get("one_day_change_bp", 0)) if spread_live and sofr_spread.get("one_day_change_bp") is not None else "—"
-spread_med = "{:+.1f} bp".format(sofr_spread.get("filtered_5d_bp", 0)) if spread_live and sofr_spread.get("filtered_5d_bp") is not None else "—"
-spread_msg = sofr_spread.get("status", {}).get("message", "Data unavailable")
+# The KPI strip renders the real last official observation even when the series
+# is stale, labeled as such, so the panel never goes blank while data exists.
+spread_view = fm.sofr_kpi_view(sofr_spread)
+spread_status = spread_view["status_label"]
+spread_current = spread_view["current"]
+spread_delta = spread_view["change"]
+spread_med = spread_view["median"]
+spread_msg = spread_view["message"]
+spread_note = ('<span class="sofr-asof">' + spread_view["note"] + '</span>') if spread_view["note"] else ''
+spread_state_cls = ' ' + spread_view["state"]
+print("SOFR-IORB panel: state={} obs={} current={} filtered={} status={}".format(
+    spread_view["state"], spread_view["as_of"], spread_current, spread_med, spread_status))
+if fast.get("errors", {}).get("sofr_iorb_alignment"):
+    print("SOFR-IORB alignment warning: " + fast["errors"]["sofr_iorb_alignment"])
 spread_details = _metric_details("SOFR − IORB", "Daily SOFR minus the Fed's Interest on Reserve Balances, in basis points. Emphasized line is a 5-observation median of non-calendar readings.",
     "Positive readings mean secured overnight funding trades above the administered reserve rate, which can indicate scarcity or balance-sheet pressure.",
     "Zero/negative is normal/easier. Calendar observations do not create alerts. Watch requires three non-calendar readings ≥ +2bp; elevated is ≥ +5bp.",
@@ -1931,6 +1939,7 @@ parts.append('.fast-value{font-size:26px;font-weight:800;line-height:1.1;color:#
 parts.append('.metric-details{margin-top:10px;border-top:1px solid #2d3748;padding-top:8px;color:#94a3b8;font-size:12px;line-height:1.55}.metric-details summary{cursor:pointer;color:#cbd5e1;font-size:12px;font-weight:700}.metric-details div{margin-top:8px}.metric-details a{color:#93c5fd}.metric-details b{color:#e2e8f0}')
 parts.append('.sofr-panel{background:#141720;border:1px solid #2d3748;border-left:3px solid #6366f1;border-radius:10px;padding:16px;margin:0 0 12px}.sofr-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:12px 0}.sofr-kpi{background:#0f131b;border-radius:7px;padding:10px;min-width:0}.sofr-kpi label{display:block;color:#94a3b8;font-size:12px;text-transform:uppercase;letter-spacing:.04em}.sofr-kpi b{display:block;color:#e2e8f0;font-size:22px;line-height:1.2;margin-top:3px;font-variant-numeric:tabular-nums lining-nums}.sofr-kpi.status b{font-size:16px}@media(max-width:760px){.sofr-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:430px){.sofr-kpis{grid-template-columns:1fr}}')
 parts.append('.sofr-chart{width:100%;height:270px}.sofr-change-chart{width:100%;height:140px}.read-guide{font-size:12px;color:#cbd5e1;line-height:1.6;background:#0f131b;border-left:3px solid #64748b;border-radius:0 7px 7px 0;padding:10px 12px;margin-top:12px}')
+parts.append('.sofr-kpi .sofr-asof{display:block;color:#f59e0b;font-size:12px;margin-top:3px;text-transform:uppercase;letter-spacing:.04em}.sofr-kpi.stale{border-left:2px solid #f59e0b}')
 parts.append('.sofr-range{font-size:12px;color:#cbd5e1;border:1px solid #475569;border-radius:4px;padding:4px 7px;margin:0 2px;background:#141720}.sofr-range.active{background:#312e81;border-color:#6366f1;color:#e2e8f0}')
 parts.append('.fx-raw{font-size:12px;color:#cbd5e1;margin:-2px 0 8px}')
 parts.append('.fx-raw b{color:#e2e8f0;font-size:13px}')
@@ -2080,10 +2089,10 @@ parts.append('<div class="fast-grid">'
 
 parts.append('<div class="sofr-panel"><div class="lpi-heading">SOFR − IORB <span>calendar-filtered funding pressure</span></div>')
 parts.append('<div class="sofr-kpis">'
-             + '<div class="sofr-kpi"><label>Current spread</label><b>' + spread_current + '</b></div>'
-             + '<div class="sofr-kpi"><label>One-day change</label><b>' + spread_delta + '</b></div>'
-             + '<div class="sofr-kpi"><label>Filtered 5d median</label><b>' + spread_med + '</b></div>'
-             + '<div class="sofr-kpi status"><label>Calendar / structural</label><b>' + spread_status.replace('-', ' ') + '</b><span class="fast-sub">' + spread_msg + '</span></div>'
+             + '<div class="sofr-kpi' + spread_state_cls + '"><label>Current spread</label><b>' + spread_current + '</b>' + spread_note + '</div>'
+             + '<div class="sofr-kpi' + spread_state_cls + '"><label>One-day change</label><b>' + spread_delta + '</b>' + spread_note + '</div>'
+             + '<div class="sofr-kpi' + spread_state_cls + '"><label>Filtered 5d median</label><b>' + spread_med + '</b>' + spread_note + '</div>'
+             + '<div class="sofr-kpi status' + spread_state_cls + '"><label>Calendar / structural</label><b>' + spread_status + '</b><span class="fast-sub">' + spread_msg + '</span></div>'
              + '</div>')
 parts.append('<div class="chart-subtitle">Raw daily spread (muted) · filtered non-calendar five-observation median (emphasized) · hollow markers = calendar noise. '
              + '<button class="sofr-range" data-range="3M">3M</button> <button class="sofr-range active" data-range="6M">6M</button> <button class="sofr-range" data-range="1Y">1Y</button> <button class="sofr-range" data-range="3Y">3Y</button></div>')
@@ -2369,7 +2378,7 @@ parts.append('  var sfrShapes=[')
 parts.append('    {type:"line",xref:"paper",x0:0,x1:1,y0:0,y1:0,line:{color:"#64748b",width:1}},')
 parts.append('    {type:"line",xref:"paper",x0:0,x1:1,y0:2,y1:2,line:{color:"#f59e0b",width:1,dash:"dash"}},')
 parts.append('    {type:"line",xref:"paper",x0:0,x1:1,y0:5,y1:5,line:{color:"#f97316",width:1,dash:"dash"}}];')
-parts.append('  var sfrAnn=[{xref:"paper",x:1,y:2,text:"+2bp watch",showarrow:false,xanchor:"right",font:{color:"#f59e0b",size:12},bgcolor:"rgba(20,23,32,.8)"},{xref:"paper",x:1,y:5,text:"+5bp elevated",showarrow:false,xanchor:"right",font:{color:"#fb923c",size:12},bgcolor:"rgba(20,23,32,.8)"}];')
+parts.append('  var sfrAnn=[{xref:"paper",x:1,y:2,text:"+2bp watch",showarrow:false,xanchor:"right",yanchor:"top",font:{color:"#f59e0b",size:12},bgcolor:"rgba(20,23,32,.8)"},{xref:"paper",x:1,y:5,text:"+5bp elevated",showarrow:false,xanchor:"right",yanchor:"bottom",font:{color:"#fb923c",size:12},bgcolor:"rgba(20,23,32,.8)"}];')
 parts.append('  var sfrTraces=[')
 parts.append('    {x:SFR.dates,y:SFR.raw,type:"scatter",mode:"lines",name:"Raw daily",line:{color:"#64748b",width:1},customdata:rawCd,hovertemplate:"%{x}<br>raw %{y:+.1f} bp<br>%{customdata}<extra></extra>"},')
 parts.append('    {x:SFR.dates,y:SFR.filtered,type:"scatter",mode:"lines",name:"Filtered 5d median",line:{color:"#a5b4fc",width:2.8},customdata:rawCd,hovertemplate:"%{x}<br>filtered %{y:+.1f} bp<br>%{customdata}<extra></extra>"},')

@@ -25,6 +25,14 @@ CBOE_VIX9D_URL = "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX9D_
 NYFED_SOFR_URL = "https://markets.newyorkfed.org/api/rates/secured/sofr/last/800.json"
 NYFED_REPO_URL = "https://markets.newyorkfed.org/api/rp/repo/all/results/last/500.json"
 FRED_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={series}&observation_start={start}"
+# Federal Reserve Data Download Program, PRATES release (IOER / IORR / IORB).
+# Used as the primary IORB source because fredgraph.csv is frequently
+# unreachable from CI runners, which used to freeze the SOFR-IORB spread.
+FRB_POLICY_RATES_URL = (
+    "https://www.federalreserve.gov/datadownload/Output.aspx?rel=PRATES"
+    "&series=c27939ee810cb2e929a920a6bd77d9f6&lastobs=&from=&to="
+    "&filetype=csv&label=include&layout=seriescolumn"
+)
 SSGA_SPY_HOLDINGS_URL = "https://www.ssga.com/us/en/intermediary/library-content/products/fund-data/etfs/us/holdings-daily-us-en-spy.xlsx"
 TREASURY_AUCTIONS_URL = (
     "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/accounting/od/auctions_query"
@@ -135,6 +143,112 @@ def fetch_fred_series(series: str, start: str = "2018-01-01", *, session=None) -
         series_data = _parse_fred_csv(cache.read_text(encoding="utf-8"), series)
         series_data.attrs["source"] = "FRED cached official CSV"
         return series_data
+
+
+def parse_frb_policy_rates_csv(text: str) -> pd.Series:
+    """Extract the daily IORB column from the Federal Reserve PRATES CSV.
+
+    The file carries several metadata rows plus IOER/IORR columns that are blank
+    after 2021, so the IORB column is located by its published description and
+    empty cells are dropped instead of being forward-filled.
+    """
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        raise ValueError("FRB policy rates response was empty")
+    header = next(pd.read_csv(StringIO(lines[0]), header=None).itertuples(index=False))
+    target = None
+    for pos, label in enumerate(header):
+        if "IORB" in str(label).upper():
+            target = pos
+            break
+    if target is None:
+        raise ValueError("FRB policy rates CSV has no IORB column")
+    rows: dict[pd.Timestamp, float] = {}
+    for line in lines[1:]:
+        fields = [f.strip().strip('"') for f in line.split(",")]
+        if target >= len(fields):
+            continue
+        day = pd.to_datetime(fields[0], errors="coerce", format="%Y-%m-%d")
+        value = pd.to_numeric(fields[target], errors="coerce")
+        if pd.isna(day) or pd.isna(value):
+            continue
+        rows[day.normalize()] = float(value)
+    if not rows:
+        raise ValueError("FRB policy rates CSV has no valid IORB observations")
+    out = pd.Series(rows).sort_index()
+    out.attrs["source"] = "Federal Reserve PRATES"
+    return out
+
+
+def fetch_frb_iorb(*, session=None) -> pd.Series:
+    """Official IORB series from the Federal Reserve, with a committed cache."""
+    cache = FRED_CACHE_DIR / "IORB_FRB.csv"
+    try:
+        response = _get(FRB_POLICY_RATES_URL, timeout=25, retries=2, session=session)
+        series = parse_frb_policy_rates_csv(response.text)
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(response.text, encoding="utf-8")
+        return series
+    except Exception as live_error:
+        if not cache.exists():
+            raise live_error
+        series = parse_frb_policy_rates_csv(cache.read_text(encoding="utf-8"))
+        series.attrs["source"] = "Federal Reserve PRATES cached CSV"
+        return series
+
+
+def splice_official(base: pd.Series | None, preferred: pd.Series | None) -> pd.Series:
+    """Overlay a preferred official series on a longer historical one.
+
+    Values from ``preferred`` win on overlapping dates; ``base`` only supplies
+    history the preferred source does not publish. Nothing is interpolated, so a
+    gap in both sources stays a gap rather than becoming an invented value.
+    """
+    frames = [s.dropna() for s in (base, preferred) if s is not None and not s.dropna().empty]
+    if not frames:
+        return pd.Series(dtype=float)
+    if len(frames) == 1:
+        return frames[0].sort_index()
+    base_clean, pref_clean = frames
+    return pref_clean.combine_first(base_clean).sort_index()
+
+
+def sofr_kpi_view(metric: dict[str, Any]) -> dict[str, str]:
+    """KPI strings for the SOFR-IORB panel.
+
+    A stale series keeps showing its real last official observation with an
+    explicit stale label; only genuinely missing data renders as an em dash. The
+    panel must never show a blank headline while a real observation exists, and
+    it must never present an old observation as if it were today's.
+    """
+    fresh = metric.get("freshness", {}) or {}
+    obs = fresh.get("observation_date") or metric.get("observation_date")
+    status = (metric.get("status") or {})
+    has_value = bool(metric.get("dates")) and metric.get("current_bp") is not None
+    if not has_value:
+        return {"state": "unavailable", "current": "—", "change": "—", "median": "—",
+                "status_label": "unavailable", "message": "No matched official SOFR/IORB observations",
+                "note": "", "as_of": obs or "unavailable"}
+
+    def bp(value: Any) -> str:
+        return "—" if value is None else "{:+.1f} bp".format(float(value))
+
+    stale = bool(fresh.get("stale"))
+    age = fresh.get("age_days")
+    view = {"state": "stale" if stale else "live",
+            "current": bp(metric.get("current_bp")),
+            "change": bp(metric.get("one_day_change_bp")),
+            "median": bp(metric.get("filtered_5d_bp")),
+            "status_label": status.get("status", "unavailable").replace("-", " "),
+            "message": status.get("message", "Data unavailable"),
+            "note": "", "as_of": obs or "unavailable"}
+    if stale:
+        view["status_label"] = "stale data"
+        view["message"] = ("Last official observation " + (obs or "unknown")
+                           + (" ({}d old)".format(age) if age is not None else "")
+                           + "; values are that observation, not today's.")
+        view["note"] = "as of " + (obs or "unknown")
+    return view
 
 
 def fetch_cboe_history(url: str, *, session=None) -> pd.Series:
@@ -482,15 +596,58 @@ def fetch_fast_metrics(snapshot_path: str | Path, now: datetime | None = None) -
         out["errors"]["reserves"] = str(exc)
 
     # SOFR / IORB, p99, and NY Fed repo operations.
+    nyfed_sofr = pd.DataFrame(columns=["median", "p99"])
     try:
         treasury_dates: set[date] = set()
         try:
             treasury_dates = fetch_treasury_settlements(session=session)
         except Exception as treasury_exc:
             out["errors"]["treasury_calendar"] = str(treasury_exc)
-        sofr_series = fetch_fred_series("SOFR", "2021-07-01", session=session)
-        iorb_series = fetch_fred_series("IORB", "2021-07-01", session=session)
+        # SOFR and IORB each come from two official sources. FRED supplies the
+        # long history; the NY Fed rates API and the Federal Reserve PRATES file
+        # supply the current tail, because fredgraph.csv times out from CI and a
+        # FRED-only path silently froze this spread on an old cached observation.
+        sources: dict[str, str] = {}
+        try:
+            nyfed_sofr = parse_sofr_api(_get(NYFED_SOFR_URL, session=session).json())
+        except Exception as nyfed_exc:
+            out["errors"]["sofr_nyfed"] = str(nyfed_exc)
+        fred_sofr = None
+        try:
+            fred_sofr = fetch_fred_series("SOFR", "2021-07-01", session=session)
+            sources["sofr_history"] = str(fred_sofr.attrs.get("source", "FRED"))
+        except Exception as sofr_exc:
+            out["errors"]["sofr_fred"] = str(sofr_exc)
+        nyfed_median = nyfed_sofr["median"] if not nyfed_sofr.empty else None
+        if nyfed_median is not None:
+            sources["sofr_current"] = "NY Fed reference rates API"
+        sofr_series = splice_official(fred_sofr, nyfed_median)
+
+        frb_iorb = None
+        try:
+            frb_iorb = fetch_frb_iorb(session=session)
+            sources["iorb"] = str(frb_iorb.attrs.get("source", "Federal Reserve PRATES"))
+        except Exception as iorb_exc:
+            out["errors"]["iorb_frb"] = str(iorb_exc)
+        fred_iorb = None
+        try:
+            fred_iorb = fetch_fred_series("IORB", "2021-07-01", session=session)
+            sources.setdefault("iorb", str(fred_iorb.attrs.get("source", "FRED")))
+        except Exception as iorb_fred_exc:
+            out["errors"]["iorb_fred"] = str(iorb_fred_exc)
+        iorb_series = splice_official(fred_iorb, frb_iorb)
+        if sofr_series.empty or iorb_series.empty:
+            raise ValueError("no official SOFR/IORB observations available")
         spread = filtered_sofr_iorb(sofr_series, iorb_series, treasury_dates)
+        if spread.empty:
+            raise ValueError("SOFR and IORB have no overlapping observation dates")
+        # Alignment guard: the spread must reach the latest SOFR observation.
+        # A shortfall means IORB coverage lags and would silently blank the panel.
+        sofr_last = sofr_series.index[-1]
+        if spread.index[-1] < sofr_last:
+            out["errors"]["sofr_iorb_alignment"] = (
+                "IORB coverage ends " + spread.index[-1].strftime("%Y-%m-%d")
+                + " but SOFR reaches " + sofr_last.strftime("%Y-%m-%d"))
         spread_fresh = freshness(spread.index[-1], "daily business day", 4, current)
         latest = spread.iloc[-1]
         out["sofr_iorb"] = {
@@ -505,18 +662,24 @@ def fetch_fast_metrics(snapshot_path: str | Path, now: datetime | None = None) -
             "daily_change_bp": [round(float(v), 3) if pd.notna(v) else None for v in spread["daily_change_bp"]],
             "calendar_flags": [", ".join(f) for f in spread["flags"]],
             "calendar_noise": [bool(v) for v in spread["calendar_noise"]],
+            "sources": sources,
         }
-        sofr_payload = _get(NYFED_SOFR_URL, session=session).json()
-        p99 = parse_sofr_api(sofr_payload)
+    except Exception as exc:
+        out["sofr_iorb"] = {"available": False, "freshness": freshness(None, "daily business day", 4, current).__dict__}
+        out["errors"]["sofr"] = str(exc)
+
+    try:
+        p99 = nyfed_sofr if not nyfed_sofr.empty else parse_sofr_api(_get(NYFED_SOFR_URL, session=session).json())
+        if p99.empty:
+            raise ValueError("NY Fed SOFR API returned no observations")
         p99_fresh = freshness(p99.index[-1], "daily business day", 4, current)
         out["sofr_tail"] = {"available": not p99_fresh.stale, "observation_date": p99.index[-1].strftime("%Y-%m-%d"),
                             "freshness": p99_fresh.__dict__, "current_bp": float((p99["p99"] - p99["median"]).iloc[-1] * 100),
                             "dates": [d.strftime("%Y-%m-%d") for d in p99.index],
                             "history_bp": [round(float(v), 3) for v in ((p99["p99"] - p99["median"]) * 100).values]}
-    except Exception as exc:
-        out["sofr_iorb"] = {"available": False, "freshness": freshness(None, "daily business day", 4, current).__dict__}
+    except Exception as tail_exc:
         out["sofr_tail"] = {"available": False, "freshness": freshness(None, "daily business day", 4, current).__dict__}
-        out["errors"]["sofr"] = str(exc)
+        out["errors"]["sofr_tail"] = str(tail_exc)
 
     try:
         repo = parse_repo_operations(_get(NYFED_REPO_URL, session=session).json())
