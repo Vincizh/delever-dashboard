@@ -1675,8 +1675,241 @@ if fast.get("errors", {}).get("sofr_iorb_alignment"):
     print("SOFR-IORB alignment warning: " + fast["errors"]["sofr_iorb_alignment"])
 spread_details = _metric_details("SOFR − IORB", "Daily SOFR minus the Fed's Interest on Reserve Balances, in basis points. Emphasized line is a 5-observation median of non-calendar readings.",
     "Positive readings mean secured overnight funding trades above the administered reserve rate, which can indicate scarcity or balance-sheet pressure.",
-    "Zero/negative is normal/easier. Calendar observations do not create alerts. Watch requires three non-calendar readings ≥ +2bp; elevated is ≥ +5bp.",
+    "Zero/negative is normal/easier. Calendar observations do not create alerts. The strategy overlay leg turns on when the filtered median and the last three non-calendar readings are all ≥ +3bp; the stricter +2bp / +5bp bands are kept as analytical reference only.",
     FAST_SOURCES["sofr"], "daily", "Month/quarter ends, major corporate tax dates, and large Treasury settlement dates are marked as calendar noise; it is a confirmation signal, not a market-top predictor.", sofr_spread)
+
+# ---------------------------------------------------------------------------
+# Dollar Funding Pressure trio (Layer 1).  One section absorbs the old
+# standalone SOFR-IORB panel and adds bank reserves and the Treasury General
+# Account, all fetched from official sources with independent failure states.
+# The absolute thresholds are the user's explicit strategy overlay, not a
+# universal empirical law, and that wording is rendered on the page.
+# ---------------------------------------------------------------------------
+FP_SOURCES = {
+    "sofr": "https://markets.newyorkfed.org/api/rates/secured/sofr/last/15.json",
+    "iorb": "https://www.federalreserve.gov/datadownload/Choose.aspx?rel=PRATES",
+    "h41": "https://www.federalreserve.gov/releases/h41/current/h41.htm",
+    "wresbal": "https://fred.stlouisfed.org/series/WRESBAL",
+    "wtregen": "https://fred.stlouisfed.org/series/WTREGEN",
+    "dts": "https://fiscaldata.treasury.gov/datasets/daily-treasury-statement/operating-cash-balance",
+}
+FP_STRATEGY_NOTE = ('These absolute levels are a <b>user-defined strategy overlay</b>, not a universal '
+                    'empirical law: +3bp, $2.90T/$2.80T and $0.90T/$1.00T are the operator\u2019s own '
+                    'trigger levels, chosen as roughly the 95th percentile of their own framework.')
+
+funding = fast.get("funding", {}) or {}
+fp_legs = funding.get("legs", {}) or {}
+res_level = fast.get("reserves_level", {}) or {}
+tga_level = fast.get("tga_level", {}) or {}
+leg_sofr = fp_legs.get("sofr", {}) or {}
+leg_res = fp_legs.get("reserves", {}) or {}
+leg_tga = fp_legs.get("tga", {}) or {}
+
+FP_STATE_CLS = {"normal": "fp-ok", "watch": "fp-watch", "warning": "fp-warn",
+                "structural-top-risk": "fp-risk", "unavailable": "fp-gray"}
+FP_LEG_GLYPH = {"elevated": "\u25a0", "active": "\u25a0", "approaching": "\u25d0",
+                "normal": "\u25cb", "stale": "\u00d7", "unavailable": "\u00d7", "incomplete": "\u00d7"}
+FP_LEG_CLS = {"elevated": "fp-risk", "active": "fp-warn", "approaching": "fp-watch",
+              "normal": "fp-ok", "stale": "fp-gray", "unavailable": "fp-gray", "incomplete": "fp-gray"}
+
+
+def _fp_delta(value, unit="B", positive_is_up=True):
+    """Signed delta with an arrow glyph so direction is not color-only."""
+    if value is None:
+        return '<span class="fp-na">\u2014</span>'
+    arrow = "\u25b2" if value > 0 else ("\u25bc" if value < 0 else "\u25ac")
+    return '<span class="fp-delta">' + arrow + " {:+,.0f}".format(value) + unit + "</span>"
+
+
+def _fp_level(metric):
+    return "${:.3f}T".format(metric["current_trillions"]) if _fast_live(metric) else "\u2014"
+
+
+def _fp_chip(leg):
+    state = leg.get("state", "unavailable")
+    return ('<span class="fp-chip ' + FP_LEG_CLS.get(state, "fp-gray") + '">'
+            + FP_LEG_GLYPH.get(state, "\u00d7") + " "
+            + (leg.get("state_label") or state).upper() + "</span>")
+
+
+def _fp_card(key, title_en, title_cn, unit_note, value, rows, leg, metric, details):
+    """One signal card: headline value, deltas, explicit rule state, freshness."""
+    body = ""
+    for label, shown in rows:
+        body += ('<div class="fp-row"><span>' + label + '</span><span>' + shown + '</span></div>')
+    live = _fast_live(metric)
+    return ('<div class="fp-card ' + FP_LEG_CLS.get(leg.get("state", "unavailable"), "fp-gray")
+            + '" data-leg="' + key + '">'
+            + '<div class="fp-card-top"><span class="fp-card-title">' + title_en
+            + '<span class="fp-cn">' + title_cn + '</span></span>' + _fp_chip(leg) + '</div>'
+            + '<div class="fp-value" data-fp-value="' + key + '">' + value + '</div>'
+            + '<div class="fp-unit">' + unit_note + '</div>'
+            + '<div class="fp-rows">' + body + '</div>'
+            + '<div class="fp-rule">' + (leg.get("detail") or "rule not evaluated") + '</div>'
+            + '<div class="fast-stamp">' + _fast_stamp(metric) + '</div>'
+            + ('' if live else '<div class="fp-rule">Excluded from resonance while stale/unavailable.</div>')
+            + details + '</div>')
+
+
+# --- Card A: funding price (SOFR - IORB) ---------------------------------
+fp_sofr_rows = [("1-day change", spread_delta),
+                ("Filtered 5-obs median", spread_med),
+                ("Latest observation", ("calendar-flagged \u00b7 excluded"
+                                        if leg_sofr.get("calendar_latest") else "non-calendar \u00b7 eligible"))]
+fp_card_sofr = _fp_card(
+    "sofr", "A. Funding price", "\u8d44\u91d1\u4ef7\u683c", "SOFR \u2212 IORB, basis points",
+    spread_current, fp_sofr_rows, leg_sofr, sofr_spread, spread_details)
+
+# --- Card B: liquidity buffer (reserve balances) -------------------------
+res_details2 = _metric_details(
+    "Bank reserve balances", "Reserve balances held by depository institutions at the Federal Reserve, "
+    "weekly average of daily figures for the week ended Wednesday (H.4.1 Table 1; FRED WRESBAL is the same series).",
+    "Reserves are the banking system's settlement buffer. A thinner buffer makes secured overnight funding "
+    "more likely to trade above the administered reserve rate.",
+    "Strategy overlay: leg active when the level is at or below $2.90T <b>and</b> the 4-week change is at or "
+    "below \u2212$50B; elevated at \u2264 $2.85T or \u2264 \u2212$100B. One condition alone shows as "
+    "<i>approaching</i> and does not count toward resonance.",
+    FP_SOURCES["h41"], "weekly (Thursday release, week ended Wednesday)",
+    "Weekly averages lag intraday conditions; no missing week is interpolated or forward-filled. "
+    "Reserves/GDP remains the separate normalized structural metric.", res_level)
+fp_card_res = _fp_card(
+    "reserves", "B. Liquidity buffer", "\u94f6\u884c\u51c6\u5907\u91d1", "Reserve balances, $ trillions",
+    _fp_level(res_level),
+    [("1-week change", _fp_delta(res_level.get("one_week_change_b"))),
+     ("4-week change", _fp_delta(res_level.get("four_week_change_b"))),
+     ("Trend speed", _fp_delta(res_level.get("speed_b_per_week"), "B/wk"))],
+    leg_res, res_level, res_details2)
+
+# --- Card C: fiscal drain (Treasury General Account) --------------------
+tga_details = _metric_details(
+    "Treasury General Account", "The U.S. Treasury's operating cash balance at the Federal Reserve, weekly "
+    "average of daily figures for the week ended Wednesday (H.4.1 Table 1; FRED WTREGEN is the same series). "
+    "The Daily Treasury Statement closing balance is used only as an official fallback tail.",
+    "Rebuilding the TGA moves cash from the banking system to the Treasury's account at the Fed, which drains "
+    "reserves one-for-one, all else equal.",
+    "Strategy overlay: leg active when the level is at or above $0.90T <b>and</b> the 4-week change is at or "
+    "above +$50B; elevated at \u2265 $1.00T or \u2265 +$100B. One condition alone shows as <i>approaching</i>.",
+    FP_SOURCES["h41"], "weekly (Thursday release, week ended Wednesday); DTS fallback is daily",
+    "Bill-settlement timing makes the balance lumpy; a weekly average smooths but also lags. "
+    "Missing weeks stay missing rather than being carried forward.", tga_level)
+fp_card_tga = _fp_card(
+    "tga", "C. Fiscal drain", "\u8d22\u653f\u62bd\u6c34", "Treasury General Account, $ trillions",
+    _fp_level(tga_level),
+    [("1-week change", _fp_delta(tga_level.get("one_week_change_b"))),
+     ("4-week change", _fp_delta(tga_level.get("four_week_change_b"))),
+     ("Rebuild speed", _fp_delta(tga_level.get("speed_b_per_week"), "B/wk"))],
+    leg_tga, tga_level, tga_details)
+
+# --- Resonance header ---------------------------------------------------
+fp_state = funding.get("state", "unavailable")
+fp_cls = FP_STATE_CLS.get(fp_state, "fp-gray")
+fp_count = funding.get("active_count", 0)
+fp_summary = funding.get("summary", "0/3 conditions active")
+fp_headline = funding.get("headline", "Data unavailable")
+fp_headline_cn = funding.get("headline_cn", "")
+fp_interp = funding.get("interpretation", "Funding resonance could not be evaluated.")
+fp_obs = " \u00b7 ".join(
+    label + " " + ((leg.get("observation_date") or "unavailable")
+                   + (" (stale)" if (leg.get("freshness") or {}).get("stale") else ""))
+    for label, leg in (("SOFR", leg_sofr), ("reserves", leg_res), ("TGA", leg_tga)))
+fp_incomplete = bool(funding.get("incomplete"))
+print("Funding trio: state={} {} active_legs={} unavailable={}".format(
+    fp_state, fp_summary, funding.get("active_legs"), funding.get("unavailable_legs")))
+print("Funding legs: reserves={} tga={} sofr={}".format(
+    leg_res.get("state"), leg_tga.get("state"), leg_sofr.get("state")))
+
+# Pressure-path nodes are ordered by causality: fiscal drain -> reserve buffer
+# -> funding price, so the arrows read as a mechanism rather than decoration.
+fp_path_nodes = [
+    ("TGA rebuild", "\u8d22\u653f\u62bd\u6c34", leg_tga, "Treasury cash balance rises"),
+    ("Reserves drain", "\u51c6\u5907\u91d1\u4e0b\u964d", leg_res, "bank settlement buffer thins"),
+    ("SOFR above IORB", "\u8d44\u91d1\u4ef7\u683c\u4e0a\u5347", leg_sofr, "secured funding prices above the Fed's floor"),
+]
+
+def _fp_slope_text(metric):
+    """Short 4-week slope cue for the chart corner (no fabricated value)."""
+    speed = metric.get("speed_b_per_week")
+    return "" if speed is None else "4-week slope {:+,.0f}B/wk".format(speed)
+
+
+fp_res_slope = _fp_slope_text(res_level)
+fp_tga_slope = _fp_slope_text(tga_level)
+
+j_fp_res = json.dumps({
+    "dates": res_level.get("dates", []), "values": res_level.get("history", []),
+    "ref_date": res_level.get("four_week_ref_date"), "current": res_level.get("current_trillions"),
+    "four_week_b": res_level.get("four_week_change_b"), "speed": res_level.get("speed_b_per_week"),
+    "obs": res_level.get("observation_date"),
+}, separators=(",", ":")).replace("</", "<\\/")
+j_fp_tga = json.dumps({
+    "dates": tga_level.get("dates", []), "values": tga_level.get("history", []),
+    "ref_date": tga_level.get("four_week_ref_date"), "current": tga_level.get("current_trillions"),
+    "four_week_b": tga_level.get("four_week_change_b"), "speed": tga_level.get("speed_b_per_week"),
+    "obs": tga_level.get("observation_date"),
+}, separators=(",", ":")).replace("</", "<\\/")
+
+
+# Expandable data description for the whole section: definitions, formulas,
+# sources, cadence, freshness, limitations, and the strategy-overlay caveat.
+def _fp_stamp_line(label, metric):
+    f = _fast_fresh(metric)
+    return (label + ": observation " + (f.get("observation_date") or "unavailable")
+            + " &middot; fetched " + (f.get("fetched_at") or fast.get("fetched_at", now_str))
+            + " &middot; " + (f.get("cadence") or "source cadence")
+            + " &middot; " + ("STALE / excluded" if f.get("stale") else "current")
+            + " &middot; source: " + str(metric.get("source", "official")))
+
+fp_details = (
+    '<details class="metric-details fp-details"><summary>About the dollar funding pressure trio '
+    '\u00b7 definitions, formulas, sources, limitations</summary><div>'
+    + '<b>What this section is.</b> Three official funding indicators in one place: the price of secured '
+      'overnight funding, the size of the banking system\u2019s reserve buffer, and the Treasury\u2019s cash '
+      'balance that drains it. ' + FP_STRATEGY_NOTE
+    + '<br><br><b>A. Funding price \u2014 SOFR \u2212 IORB.</b> Formula: '
+      '<code>(SOFR \u2212 IORB) \u00d7 100</code> in basis points, daily. The emphasized line is the median of the '
+      'last five <i>non-calendar</i> observations; month-end, quarter-end, major corporate tax dates and large '
+      'Treasury settlement dates are flagged as calendar noise and excluded from the filter and from the rule. '
+      'Why it matters: a positive spread means secured funding trades above the Fed\u2019s administered floor, '
+      'which points to collateral or balance-sheet pressure. Strategy overlay leg: <b>active when the filtered '
+      'median \u2265 +3.0bp and the last 3 eligible (non-calendar) observations are all \u2265 +3.0bp</b>, so one '
+      'calendar spike cannot trigger it. The +2bp / +5bp lines remain as this dashboard\u2019s stricter analytical '
+      'reference bands.'
+    + '<br><br><b>B. Liquidity buffer \u2014 bank reserve balances.</b> Reserve balances of depository '
+      'institutions at Federal Reserve Banks, weekly average of daily figures for the week ended Wednesday '
+      '(H.4.1 Table 1; identical to FRED WRESBAL). Changes are computed as '
+      '<code>current \u2212 as-of(t\u22127d)</code> and <code>current \u2212 as-of(t\u221228d)</code> in $ billions '
+      'against real observation dates; trend speed is the 4-week change \u00f7 4. Strategy overlay leg: '
+      '<b>active when level \u2264 $2.90T AND 4-week change \u2264 \u2212$50B</b>; elevated when level \u2264 $2.85T '
+      'or 4-week change \u2264 \u2212$100B. If only one of the two conditions holds, the card reads '
+      '<i>approaching</i> and the leg does not count. Reserves/GDP with its rolling percentile is kept '
+      'separately above as normalized structural context.'
+    + '<br><br><b>C. Fiscal drain \u2014 Treasury General Account.</b> The Treasury\u2019s operating cash balance '
+      'at the Fed, same weekly basis (H.4.1 Table 1; identical to FRED WTREGEN); the Daily Treasury Statement '
+      'closing balance is an official fallback tail when the weekly path is stale. Strategy overlay leg: '
+      '<b>active when level \u2265 $0.90T AND 4-week change \u2265 +$50B</b>; elevated when level \u2265 $1.00T or '
+      '4-week change \u2265 +$100B.'
+    + '<br><br><b>How to read the three-leg resonance.</b> 0/3 normal \u00b7 1/3 watch (the named leg only) \u00b7 '
+      '2/3 yellow warning, funding pressure building \u00b7 3/3 structural-top risk signal. 3/3 is a '
+      '<b>fragility confirmation</b> under this overlay \u2014 it is not a standalone or deterministic market-top '
+      'forecast, and it carries no timing claim.'
+    + '<br><br><b>Official sources.</b> '
+      '<a href="' + FP_SOURCES["sofr"] + '" target="_blank" rel="noopener">NY Fed SOFR reference rates</a> &middot; '
+      '<a href="' + FP_SOURCES["iorb"] + '" target="_blank" rel="noopener">Federal Reserve PRATES (IORB)</a> &middot; '
+      '<a href="' + FP_SOURCES["h41"] + '" target="_blank" rel="noopener">Federal Reserve H.4.1</a> &middot; '
+      '<a href="' + FP_SOURCES["wresbal"] + '" target="_blank" rel="noopener">FRED WRESBAL</a> &middot; '
+      '<a href="' + FP_SOURCES["wtregen"] + '" target="_blank" rel="noopener">FRED WTREGEN</a> &middot; '
+      '<a href="' + FP_SOURCES["dts"] + '" target="_blank" rel="noopener">Treasury Daily Treasury Statement</a>'
+    + '<br><br><b>Cadence, observation dates and fetch times.</b><br>'
+    + _fp_stamp_line("SOFR \u2212 IORB", sofr_spread) + '<br>'
+    + _fp_stamp_line("Reserve balances", res_level) + '<br>'
+    + _fp_stamp_line("Treasury General Account", tga_level)
+    + '<br><br><b>Limitations.</b> Reserves and the TGA are weekly averages released with a lag, so they cannot '
+      'confirm intraday funding stress. No missing official observation is fabricated, interpolated or '
+      'forward-filled: a gap stays a gap, a stale leg is labelled stale and excluded from the resonance count, '
+      'and each leg fails independently so one unavailable series never blanks the other two. The absolute '
+      'dollar and basis-point levels are regime-dependent \u2014 they are the operator\u2019s chosen strategy '
+      'thresholds, not an estimated statistical law.'
+    + '</div></details>')
 
 # Layer 2: concentration
 conc = fast.get("concentration", {})
@@ -1939,6 +2172,7 @@ parts.append('.fast-value{font-size:26px;font-weight:800;line-height:1.1;color:#
 parts.append('.metric-details{margin-top:10px;border-top:1px solid #2d3748;padding-top:8px;color:#94a3b8;font-size:12px;line-height:1.55}.metric-details summary{cursor:pointer;color:#cbd5e1;font-size:12px;font-weight:700}.metric-details div{margin-top:8px}.metric-details a{color:#93c5fd}.metric-details b{color:#e2e8f0}')
 parts.append('.sofr-panel{background:#141720;border:1px solid #2d3748;border-left:3px solid #6366f1;border-radius:10px;padding:16px;margin:0 0 12px}.sofr-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:12px 0}.sofr-kpi{background:#0f131b;border-radius:7px;padding:10px;min-width:0}.sofr-kpi label{display:block;color:#94a3b8;font-size:12px;text-transform:uppercase;letter-spacing:.04em}.sofr-kpi b{display:block;color:#e2e8f0;font-size:22px;line-height:1.2;margin-top:3px;font-variant-numeric:tabular-nums lining-nums}.sofr-kpi.status b{font-size:16px}@media(max-width:760px){.sofr-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:430px){.sofr-kpis{grid-template-columns:1fr}}')
 parts.append('.sofr-chart{width:100%;height:270px}.sofr-change-chart{width:100%;height:140px}.read-guide{font-size:12px;color:#cbd5e1;line-height:1.6;background:#0f131b;border-left:3px solid #64748b;border-radius:0 7px 7px 0;padding:10px 12px;margin-top:12px}')
+parts.append('.fp-panel{border-left-width:4px}.fp-panel.fp-ok{border-left-color:#10b981}.fp-panel.fp-watch{border-left-color:#f59e0b}.fp-panel.fp-warn{border-left-color:#f97316}.fp-panel.fp-risk{border-left-color:#ef4444}.fp-panel.fp-gray{border-left-color:#64748b}.fp-header{display:flex;gap:14px;align-items:flex-start;margin:12px 0 10px;background:#0f131b;border-radius:9px;padding:12px 14px}.fp-score{flex:0 0 auto;display:flex;align-items:baseline;gap:4px;padding:8px 14px;border-radius:8px;border:1px solid #2d3748;background:#141720}.fp-score b{font-size:34px;line-height:1;font-variant-numeric:tabular-nums lining-nums;color:#e2e8f0}.fp-score span{font-size:14px;color:#94a3b8}.fp-score.fp-ok b{color:#10b981}.fp-score.fp-watch b{color:#f59e0b}.fp-score.fp-warn b{color:#f97316}.fp-score.fp-risk b{color:#ef4444}.fp-headline{min-width:0}.fp-state{font-size:19px;font-weight:600;color:#e2e8f0;line-height:1.25}.fp-cn{margin-left:7px;color:#94a3b8;font-size:13px;font-weight:400}.fp-summary{font-size:12px;color:#cbd5e1;text-transform:uppercase;letter-spacing:.06em;margin-top:3px}.fp-incomplete{color:#f59e0b}.fp-interp{font-size:13px;color:#cbd5e1;line-height:1.55;margin-top:6px}.fp-freshness{font-size:11.5px;color:#94a3b8;margin-top:6px;line-height:1.5}.fp-overlay-note{font-size:12px;color:#cbd5e1;line-height:1.55;background:#141a26;border-left:3px solid #6366f1;border-radius:0 7px 7px 0;padding:8px 11px;margin:0 0 12px}.fp-cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin:0 0 12px}.fp-card{background:#0f131b;border:1px solid #232a38;border-top:3px solid #64748b;border-radius:8px;padding:11px 12px;min-width:0}.fp-card.fp-ok{border-top-color:#10b981}.fp-card.fp-watch{border-top-color:#f59e0b}.fp-card.fp-warn{border-top-color:#f97316}.fp-card.fp-risk{border-top-color:#ef4444}.fp-card.fp-gray{border-top-color:#64748b}.fp-card-top{display:flex;justify-content:space-between;gap:8px;align-items:flex-start}.fp-card-title{font-size:12.5px;color:#e2e8f0;font-weight:600;line-height:1.3}.fp-chip{font-size:10px;letter-spacing:.06em;text-transform:uppercase;border:1px solid #2d3748;border-radius:999px;padding:2px 7px;white-space:nowrap;color:#cbd5e1;flex:0 0 auto}.fp-chip.fp-ok{color:#34d399;border-color:#10b98166}.fp-chip.fp-watch{color:#fbbf24;border-color:#f59e0b66}.fp-chip.fp-warn{color:#fb923c;border-color:#f9731666}.fp-chip.fp-risk{color:#f87171;border-color:#ef444466}.fp-chip.fp-gray{color:#94a3b8;border-color:#475569}.fp-value{font-size:26px;color:#e2e8f0;font-variant-numeric:tabular-nums lining-nums;margin-top:7px;line-height:1.15}.fp-unit{font-size:10.5px;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em;margin-top:1px}.fp-rows{margin-top:8px;border-top:1px solid #1e2433}.fp-row{display:flex;justify-content:space-between;gap:8px;font-size:12px;color:#94a3b8;padding:4px 0;border-bottom:1px solid #161c27}.fp-row span:last-child{color:#e2e8f0;font-variant-numeric:tabular-nums lining-nums;text-align:right}.fp-delta{font-variant-numeric:tabular-nums lining-nums}.fp-na{color:#64748b}.fp-rule{font-size:11.5px;color:#94a3b8;line-height:1.5;margin-top:7px}.fp-card .metric-details{margin-top:8px}.fp-path{background:#0f131b;border-radius:9px;padding:11px 12px;margin:0 0 12px}.fp-path-title{font-size:12px;color:#e2e8f0;font-weight:600;text-transform:uppercase;letter-spacing:.06em}.fp-path-title span{text-transform:none;font-weight:400;color:#94a3b8;letter-spacing:0;margin-left:6px;font-size:12px}.fp-path-flow{display:flex;align-items:stretch;gap:8px;margin:9px 0 8px}.fp-node{flex:1 1 0;min-width:0;background:#141720;border:1px solid #232a38;border-left:3px solid #64748b;border-radius:7px;padding:8px 9px}.fp-node.fp-ok{border-left-color:#10b981}.fp-node.fp-watch{border-left-color:#f59e0b}.fp-node.fp-warn{border-left-color:#f97316}.fp-node.fp-risk{border-left-color:#ef4444}.fp-node.fp-gray{border-left-color:#64748b}.fp-node-name{font-size:12.5px;color:#e2e8f0;font-weight:600;margin-bottom:6px;line-height:1.3}.fp-node-note{font-size:11.5px;color:#94a3b8;line-height:1.45;margin-top:6px}.fp-arrow{flex:0 0 auto;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#94a3b8;font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;gap:2px}.fp-arrow-glyph{font-size:18px;color:#818cf8;line-height:1}.fp-a-v{display:none}.fp-charts{margin-top:2px}.fp-chart{width:100%;height:210px}#chart-sofr-iorb{height:250px}.fp-chart-head{font-size:12.5px;color:#e2e8f0;margin:12px 0 2px;line-height:1.4}.fp-chart-head span{color:#94a3b8;font-size:11.5px;font-weight:400}.fp-expand{margin:4px 0 2px}.fp-expand summary{cursor:pointer;font-size:12px;color:#a5b4fc}.fp-details{margin-top:10px}@media(max-width:860px){.fp-cards{grid-template-columns:1fr}.fp-header{flex-direction:column;gap:10px}.fp-path-flow{flex-direction:column}.fp-a-h{display:none}.fp-a-v{display:inline}.fp-arrow{flex-direction:row;gap:7px;padding:1px 0}.fp-value{font-size:24px}}@media(max-width:430px){.fp-panel{padding:12px 11px}.fp-score b{font-size:30px}.fp-state{font-size:17px}}')
 parts.append('.sofr-kpi .sofr-asof{display:block;color:#f59e0b;font-size:12px;margin-top:3px;text-transform:uppercase;letter-spacing:.04em}.sofr-kpi.stale{border-left:2px solid #f59e0b}')
 parts.append('.sofr-range{font-size:12px;color:#cbd5e1;border:1px solid #475569;border-radius:4px;padding:4px 7px;margin:0 2px;background:#141720}.sofr-range.active{background:#312e81;border-color:#6366f1;color:#e2e8f0}')
 parts.append('.fx-raw{font-size:12px;color:#cbd5e1;margin:-2px 0 8px}')
@@ -2087,18 +2321,69 @@ parts.append('<div class="fast-grid">'
              + _fast_card('SOFR p99 − median', tail_value, 'Tail-rate pressure; use with persistent spread and repo use.', sofr_tail, 'normal', tail_details)
              + '</div>')
 
-parts.append('<div class="sofr-panel"><div class="lpi-heading">SOFR − IORB <span>calendar-filtered funding pressure</span></div>')
-parts.append('<div class="sofr-kpis">'
-             + '<div class="sofr-kpi' + spread_state_cls + '"><label>Current spread</label><b>' + spread_current + '</b>' + spread_note + '</div>'
-             + '<div class="sofr-kpi' + spread_state_cls + '"><label>One-day change</label><b>' + spread_delta + '</b>' + spread_note + '</div>'
-             + '<div class="sofr-kpi' + spread_state_cls + '"><label>Filtered 5d median</label><b>' + spread_med + '</b>' + spread_note + '</div>'
-             + '<div class="sofr-kpi status' + spread_state_cls + '"><label>Calendar / structural</label><b>' + spread_status + '</b><span class="fast-sub">' + spread_msg + '</span></div>'
-             + '</div>')
-parts.append('<div class="chart-subtitle">Raw daily spread (muted) · filtered non-calendar five-observation median (emphasized) · hollow markers = calendar noise. '
-             + '<button class="sofr-range" data-range="3M">3M</button> <button class="sofr-range active" data-range="6M">6M</button> <button class="sofr-range" data-range="1Y">1Y</button> <button class="sofr-range" data-range="3Y">3Y</button></div>')
-parts.append('<div id="chart-sofr-iorb" class="sofr-chart"></div><div id="chart-sofr-change" class="sofr-change-chart"></div>')
-parts.append('<div class="read-guide"><b>Read guide.</b> Positive means secured overnight funding is trading above the Fed’s administered reserve rate, suggesting scarcity or balance-sheet pressure; negative or zero is normal/easier. Isolated calendar spikes are noise. Persistence with repo use and SOFR tail widening is confirmation. This is a stress-confirmation signal, not a market-top predictor by itself.</div>')
-parts.append(spread_details + '</div>')
+# --- Dollar Funding Pressure section (absorbs the standalone SOFR-IORB panel) ---
+parts.append('<div class="sofr-panel fp-panel ' + fp_cls + '" id="funding-pressure">')
+parts.append('<div class="lpi-heading">Dollar Funding Pressure <span>\u7f8e\u5143\u8d44\u91d1\u538b\u529b '
+             '\u00b7 SOFR\u2212IORB + bank reserves + TGA</span></div>')
+parts.append('<div class="fp-header">'
+             + '<div class="fp-score ' + fp_cls + '"><b>' + str(fp_count) + '</b><span>/ 3</span></div>'
+             + '<div class="fp-headline">'
+             + '<div class="fp-state">' + fp_headline + '<span class="fp-cn">' + fp_headline_cn + '</span></div>'
+             + '<div class="fp-summary">' + fp_summary
+             + (' <span class="fp-incomplete">\u26a0 incomplete data</span>' if fp_incomplete else '')
+             + '</div>'
+             + '<div class="fp-interp">' + fp_interp + '</div>'
+             + '<div class="fp-freshness">Observations: ' + fp_obs + ' &middot; fetched '
+             + fast.get("fetched_at", now_str) + '</div>'
+             + '</div></div>')
+parts.append('<div class="fp-overlay-note">' + FP_STRATEGY_NOTE + '</div>')
+parts.append('<div class="fp-cards">' + fp_card_sofr + fp_card_res + fp_card_tga + '</div>')
+
+# Pressure path: explicit causality, arrows and words rather than decoration.
+_path = '<div class="fp-path"><div class="fp-path-title">Pressure path <span>\u4f20\u5bfc\u8def\u5f84 \u00b7 read left to right</span></div><div class="fp-path-flow">'
+for _i, (_en, _cn, _leg, _note) in enumerate(fp_path_nodes):
+    if _i:
+        _path += ('<div class="fp-arrow"><span class="fp-arrow-label">'
+                  + ('drains' if _i == 1 else 'prices up')
+                  + '</span><span class="fp-arrow-glyph fp-a-h">\u2192</span>'
+                  + '<span class="fp-arrow-glyph fp-a-v">\u2193</span></div>')
+    _path += ('<div class="fp-node ' + FP_LEG_CLS.get(_leg.get("state", "unavailable"), "fp-gray") + '">'
+              + '<div class="fp-node-name">' + _en + '<span class="fp-cn">' + _cn + '</span></div>'
+              + _fp_chip(_leg)
+              + '<div class="fp-node-note">' + _note + '</div></div>')
+_path += ('</div><div class="fp-path-caption"><b>Direction.</b> A rebuilding TGA moves cash from banks to the '
+          'Treasury\u2019s account at the Fed, which <b>drains bank reserves</b> one-for-one; a thinner reserve '
+          'buffer makes secured overnight funding <b>price above IORB</b>. All three moving together is what the '
+          'strategy overlay treats as resonance.</div></div>')
+parts.append(_path)
+
+# Aligned small multiples: one panel per series, each with its own units and
+# threshold shading.  No dual or triple axes.
+parts.append('<div class="chart-subtitle">Three aligned panels share one x-axis and one range control. '
+             + '<button class="sofr-range" data-range="3M">3M</button> <button class="sofr-range active" data-range="6M">6M</button> '
+             + '<button class="sofr-range" data-range="1Y">1Y</button> <button class="sofr-range" data-range="3Y">3Y</button></div>')
+parts.append('<div class="fp-charts">')
+parts.append('<div class="fp-chart-head"><b>A. Funding price</b> <span>SOFR \u2212 IORB, basis points \u00b7 '
+             'raw muted, filtered non-calendar 5-observation median emphasized, hollow markers = calendar noise</span></div>')
+parts.append('<div id="chart-sofr-iorb" class="fp-chart sofr-chart"></div>')
+parts.append('<details class="fp-expand"><summary>Show daily change bars (\u0394 bp/day)</summary>'
+             '<div id="chart-sofr-change" class="sofr-change-chart"></div></details>')
+parts.append('<div class="fp-chart-head"><b>B. Liquidity buffer</b> <span>bank reserve balances, $ trillions \u00b7 '
+             '$2.90T / $2.80T reference band, 4-week slope cue</span></div>')
+parts.append('<div id="chart-fp-reserves" class="fp-chart"></div>')
+parts.append('<div class="fp-chart-head"><b>C. Fiscal drain</b> <span>Treasury General Account, $ trillions \u00b7 '
+             '$0.90T watch / $1.00T threshold, 4-week slope cue</span></div>')
+parts.append('<div id="chart-fp-tga" class="fp-chart"></div>')
+parts.append('</div>')
+
+parts.append('<div class="read-guide"><b>Read guide.</b> <b>0/3</b> normal, no resonance. <b>1/3</b> watch \u2014 a '
+             'single leg is common and is not a fragility signal. <b>2/3</b> yellow warning \u2014 funding pressure '
+             'building. <b>3/3</b> structural-top risk signal \u2014 fragility <i>confirmation</i>, explicitly not a '
+             'deterministic market-top prediction. A stale or unavailable leg never counts as triggered; the header '
+             'shows an incomplete-data state instead. The stricter +2bp / +5bp bands are kept as analytical '
+             'reference lines: they are this dashboard\u2019s persistence-based statistical bands, while the '
+             'emphasized +3bp line is the operator\u2019s strategy threshold.</div>')
+parts.append(fp_details + '</div>')
 
 # gauge card with regime badge
 parts.append('<div class="lpi-gauge ' + reg_cls + '">')
@@ -2370,28 +2655,66 @@ parts.append('  yaxis:{gridcolor:"#1e2433",zerolinecolor:"#2d3748",tickfont:{siz
 parts.append('  margin:{l:40,r:8,t:8,b:40},showlegend:false,height:190,autosize:true};')
 parts.append('var CFG={responsive:true,displayModeBar:false};')
 parts.append('var SFR=' + j_sofr_spread + ';')
+parts.append('var FPR=' + j_fp_res + ',FPT=' + j_fp_tga + ';')
 parts.append('var sfrEl=document.getElementById("chart-sofr-iorb"),sfrChEl=document.getElementById("chart-sofr-change");var sfrIds=[];')
+# One shared x-range plus a per-panel y fit that always keeps the threshold
+# lines inside the visible window, so the aligned small multiples stay readable.
+parts.append('var FP_PANELS=[];var FP_NARROW=window.innerWidth<560;function fpNum(v){return typeof v==="number"&&isFinite(v);}')
+parts.append('function fpEmpty(el,label){if(el)el.innerHTML="<div style=\\"color:#94a3b8;font-size:12px;padding:20px 0\\">"+label+" unavailable or stale; no current value shown.</div>";}')
+parts.append('function fpLevelPanel(id,D,o){var el=document.getElementById(id);if(!el)return;')
+parts.append('  if(!D.dates||!D.dates.length){fpEmpty(el,o.label);return;}')
+parts.append('  var n=D.dates.length,ri=D.ref_date?D.dates.indexOf(D.ref_date):-1;')
+parts.append('  var traces=[{x:D.dates,y:D.values,type:"scatter",mode:"lines",name:o.label,line:{color:o.color,width:2.4},hovertemplate:"%{x}<br>"+o.label+" $%{y:.3f}T<extra></extra>"}];')
+parts.append('  if(ri>=0){traces.push({x:[D.dates[ri],D.dates[n-1]],y:[D.values[ri],D.values[n-1]],type:"scatter",mode:"lines+markers",name:"4-week slope",line:{color:"#e2e8f0",width:2,dash:"dot"},marker:{size:7,symbol:"diamond",color:"#e2e8f0"},hovertemplate:"4-week slope<br>%{x}: $%{y:.3f}T<extra></extra>"});}')
+parts.append('  var shapes=[{type:"rect",xref:"paper",x0:0,x1:1,yref:"y",y0:Math.min(o.t1,o.t2),y1:Math.max(o.t1,o.t2),fillcolor:o.band,line:{width:0},layer:"below"},')
+parts.append('    {type:"line",xref:"paper",x0:0,x1:1,y0:o.t1,y1:o.t1,line:{color:"#f59e0b",width:1.4,dash:"dash"}},')
+parts.append('    {type:"line",xref:"paper",x0:0,x1:1,y0:o.t2,y1:o.t2,line:{color:"#ef4444",width:1.4,dash:"dot"}}];')
+parts.append('  var ann=[{xref:"paper",x:0.004,y:o.t1,text:(FP_NARROW&&o.s1?o.s1:o.l1),showarrow:false,xanchor:"left",yanchor:"bottom",font:{color:"#f59e0b",size:11},bgcolor:"rgba(15,19,27,.85)"},')
+parts.append('    {xref:"paper",x:0.004,y:o.t2,text:(FP_NARROW&&o.s2?o.s2:o.l2),showarrow:false,xanchor:"left",yanchor:"top",font:{color:"#f87171",size:11},bgcolor:"rgba(15,19,27,.85)"}];')
+parts.append('  if(o.slope){ann.push({xref:"paper",x:1,yref:"paper",y:1.02,text:o.slope,showarrow:false,xanchor:"right",yanchor:"bottom",font:{color:"#cbd5e1",size:11},bgcolor:"rgba(15,19,27,.85)"});}')
+parts.append('  var lay=Object.assign({},T,{height:210,hovermode:"x unified",showlegend:false,margin:{l:54,r:12,t:16,b:30},shapes:shapes,annotations:ann,xaxis:Object.assign({},T.xaxis,{type:"date",nticks:6}),yaxis:Object.assign({},T.yaxis,{title:{text:o.unit,font:{size:11}},tickformat:".2f"})});')
+parts.append('  Plotly.newPlot(id,traces,lay,CFG);FP_PANELS.push({id:id,dates:D.dates,series:[D.values],must:[o.t1,o.t2]});sfrIds.push(id);}')
 parts.append('if(sfrEl&&SFR.dates&&SFR.dates.length){')
 parts.append('  var noiseX=SFR.dates.filter(function(_,i){return SFR.noise[i];});var noiseY=SFR.raw.filter(function(_,i){return SFR.noise[i];});var noiseF=SFR.flags.filter(function(_,i){return SFR.noise[i];});')
 parts.append('  var rawCd=SFR.flags.map(function(v,i){var t=v||"non-calendar";return i===SFR.flags.length-1?t+" · latest: "+SFR.latest_status:t;});')
 parts.append('  var sfrShapes=[')
 parts.append('    {type:"line",xref:"paper",x0:0,x1:1,y0:0,y1:0,line:{color:"#64748b",width:1}},')
-parts.append('    {type:"line",xref:"paper",x0:0,x1:1,y0:2,y1:2,line:{color:"#f59e0b",width:1,dash:"dash"}},')
-parts.append('    {type:"line",xref:"paper",x0:0,x1:1,y0:5,y1:5,line:{color:"#f97316",width:1,dash:"dash"}}];')
-parts.append('  var sfrAnn=[{xref:"paper",x:1,y:2,text:"+2bp watch",showarrow:false,xanchor:"right",yanchor:"top",font:{color:"#f59e0b",size:12},bgcolor:"rgba(20,23,32,.8)"},{xref:"paper",x:1,y:5,text:"+5bp elevated",showarrow:false,xanchor:"right",yanchor:"bottom",font:{color:"#fb923c",size:12},bgcolor:"rgba(20,23,32,.8)"}];')
+parts.append('    {type:"line",xref:"paper",x0:0,x1:1,y0:2,y1:2,line:{color:"#475569",width:1,dash:"dot"}},')
+parts.append('    {type:"line",xref:"paper",x0:0,x1:1,y0:5,y1:5,line:{color:"#475569",width:1,dash:"dot"}},')
+parts.append('    {type:"line",xref:"paper",x0:0,x1:1,y0:3,y1:3,line:{color:"#f59e0b",width:2,dash:"dash"}}];')
+parts.append('  var sfrAnn=[{xref:"paper",x:0.004,y:3,text:FP_NARROW?"+3bp":"+3bp strategy threshold",showarrow:false,xanchor:"left",yanchor:"bottom",font:{color:"#f59e0b",size:11},bgcolor:"rgba(15,19,27,.85)"},')
+parts.append('    {xref:"paper",x:0.985,y:2,text:FP_NARROW?"+2":"+2bp ref",showarrow:false,xanchor:"right",yanchor:"top",font:{color:"#94a3b8",size:11},bgcolor:"rgba(15,19,27,.85)"},')
+parts.append('    {xref:"paper",x:0.985,y:5,text:FP_NARROW?"+5":"+5bp ref",showarrow:false,xanchor:"right",yanchor:"bottom",font:{color:"#94a3b8",size:11},bgcolor:"rgba(15,19,27,.85)"}];')
 parts.append('  var sfrTraces=[')
 parts.append('    {x:SFR.dates,y:SFR.raw,type:"scatter",mode:"lines",name:"Raw daily",line:{color:"#64748b",width:1},customdata:rawCd,hovertemplate:"%{x}<br>raw %{y:+.1f} bp<br>%{customdata}<extra></extra>"},')
 parts.append('    {x:SFR.dates,y:SFR.filtered,type:"scatter",mode:"lines",name:"Filtered 5d median",line:{color:"#a5b4fc",width:2.8},customdata:rawCd,hovertemplate:"%{x}<br>filtered %{y:+.1f} bp<br>%{customdata}<extra></extra>"},')
 parts.append('    {x:noiseX,y:noiseY,type:"scatter",mode:"markers",name:"Calendar noise",marker:{symbol:"circle-open",size:8,color:"#cbd5e1",line:{color:"#94a3b8",width:1.5}},customdata:noiseF,hovertemplate:"%{x}<br>calendar noise: %{customdata}<br>raw %{y:+.1f} bp<extra></extra>"}];')
-parts.append('  var sfrLayout=Object.assign({},T,{height:270,hovermode:"x unified",showlegend:true,legend:{orientation:"h",font:{size:12},y:1.15,x:0},margin:{l:46,r:12,t:30,b:36},shapes:sfrShapes,annotations:sfrAnn,xaxis:Object.assign({},T.xaxis,{type:"date"}),yaxis:Object.assign({},T.yaxis,{title:{text:"basis points",font:{size:12}},zeroline:true})});')
+parts.append('  var sfrLayout=Object.assign({},T,{height:250,hovermode:"x unified",showlegend:true,legend:{orientation:"h",font:{size:12},y:1.18,x:0},margin:{l:54,r:12,t:30,b:30},shapes:sfrShapes,annotations:sfrAnn,xaxis:Object.assign({},T.xaxis,{type:"date",nticks:6}),yaxis:Object.assign({},T.yaxis,{title:{text:"basis points",font:{size:11}},zeroline:true})});')
 parts.append('  Plotly.newPlot("chart-sofr-iorb",sfrTraces,sfrLayout,CFG);')
+parts.append('  FP_PANELS.push({id:"chart-sofr-iorb",dates:SFR.dates,series:[SFR.raw,SFR.filtered],must:[0,3]});sfrIds.push("chart-sofr-iorb");')
 parts.append('  var chColors=SFR.changes.map(function(v){return v===null?"#64748b":(v>0?"#f97316":(v<0?"#14b8a6":"#64748b"));});')
 parts.append('  var chTrace={x:SFR.dates,y:SFR.changes,type:"bar",marker:{color:chColors},customdata:rawCd,hovertemplate:"%{x}<br>daily change %{y:+.1f} bp<br>%{customdata}<extra></extra>"};')
-parts.append('  var chLayout=Object.assign({},T,{height:140,margin:{l:46,r:12,t:8,b:34},shapes:[{type:"line",xref:"paper",x0:0,x1:1,y0:0,y1:0,line:{color:"#64748b",width:1}}],xaxis:Object.assign({},T.xaxis,{type:"date"}),yaxis:Object.assign({},T.yaxis,{title:{text:"Δ bp",font:{size:12}}})});')
-parts.append('  Plotly.newPlot("chart-sofr-change",[chTrace],chLayout,CFG);sfrIds=["chart-sofr-iorb","chart-sofr-change"];')
-parts.append('  function setSfrRange(label){var last=new Date(SFR.dates[SFR.dates.length-1]+"T00:00:00Z"),months={\"3M\":3,\"6M\":6,\"1Y\":12,\"3Y\":36}[label]||6,start=new Date(last);start.setUTCMonth(start.getUTCMonth()-months);var r=[start.toISOString().slice(0,10),SFR.dates[SFR.dates.length-1]];Plotly.relayout("chart-sofr-iorb",{"xaxis.range":r});Plotly.relayout("chart-sofr-change",{"xaxis.range":r});document.querySelectorAll(".sofr-range").forEach(function(b){b.classList.toggle("active",b.dataset.range===label);});}')
-parts.append('  document.querySelectorAll(".sofr-range").forEach(function(b){b.addEventListener("click",function(){setSfrRange(b.dataset.range);});});setSfrRange("6M");')
-parts.append('}else{if(sfrEl)sfrEl.innerHTML="<div style=\\"color:#94a3b8;font-size:12px;padding:24px 0\\">SOFR–IORB history unavailable or stale; no current value shown.</div>";if(sfrChEl)sfrChEl.innerHTML="";}')
+parts.append('  var chLayout=Object.assign({},T,{height:130,margin:{l:54,r:12,t:8,b:28},shapes:[{type:"line",xref:"paper",x0:0,x1:1,y0:0,y1:0,line:{color:"#64748b",width:1}}],xaxis:Object.assign({},T.xaxis,{type:"date",nticks:6}),yaxis:Object.assign({},T.yaxis,{title:{text:"Δ bp",font:{size:11}}})});')
+parts.append('  Plotly.newPlot("chart-sofr-change",[chTrace],chLayout,CFG);')
+parts.append('  FP_PANELS.push({id:"chart-sofr-change",dates:SFR.dates,series:[SFR.changes],must:[0]});sfrIds.push("chart-sofr-change");')
+parts.append('}else{fpEmpty(sfrEl,"SOFR–IORB history");if(sfrChEl)sfrChEl.innerHTML="";}')
+# Reserves and TGA panels are built independently: an outage in one leg leaves
+# the other two panels intact.
+parts.append('fpLevelPanel("chart-fp-reserves",FPR,{label:"Reserve balances",unit:"$ trillions",color:"#38bdf8",'
+             + 't1:' + str(fm.RESERVE_TRIGGER_LEVEL_T) + ',l1:"$2.90T strategy level",s1:"$2.90T",s2:"$2.80T",t2:' + str(fm.RESERVE_TARGET_LEVEL_T)
+             + ',l2:"$2.80T target of the decline",band:"rgba(245,158,11,0.07)",slope:' + json.dumps(fp_res_slope) + '});')
+parts.append('fpLevelPanel("chart-fp-tga",FPT,{label:"Treasury General Account",unit:"$ trillions",color:"#c084fc",'
+             + 't1:' + str(fm.TGA_TRIGGER_LEVEL_T) + ',l1:"$0.90T watch level",s1:"$0.90T",s2:"$1.00T",t2:' + str(fm.TGA_ELEVATED_LEVEL_T)
+             + ',l2:"$1.00T rebuild threshold",band:"rgba(245,158,11,0.07)",slope:' + json.dumps(fp_tga_slope) + '});')
+parts.append('var FP_LAST=(SFR.dates&&SFR.dates.length?SFR.dates[SFR.dates.length-1]:(FPR.dates&&FPR.dates.length?FPR.dates[FPR.dates.length-1]:(FPT.dates&&FPT.dates.length?FPT.dates[FPT.dates.length-1]:null)));')
+parts.append('function setSfrRange(label){if(!FP_LAST||!FP_PANELS.length)return;var months={"3M":3,"6M":6,"1Y":12,"3Y":36}[label]||6;')
+parts.append('  var start=new Date(FP_LAST+"T00:00:00Z");start.setUTCMonth(start.getUTCMonth()-months);var r=[start.toISOString().slice(0,10),FP_LAST];')
+parts.append('  FP_PANELS.forEach(function(p){var lo=null,hi=null;for(var i=0;i<p.dates.length;i++){if(p.dates[i]<r[0]||p.dates[i]>r[1])continue;p.series.forEach(function(s){var v=s?s[i]:null;if(fpNum(v)){if(lo===null||v<lo)lo=v;if(hi===null||v>hi)hi=v;}});}')
+parts.append('    (p.must||[]).forEach(function(v){if(fpNum(v)){if(lo===null||v<lo)lo=v;if(hi===null||v>hi)hi=v;}});')
+parts.append('    var upd={"xaxis.range":r};if(lo!==null&&hi!==null){var pad=(hi-lo)*0.12||Math.abs(hi)*0.05||1;upd["yaxis.range"]=[lo-pad,hi+pad];}Plotly.relayout(p.id,upd);});')
+parts.append('  document.querySelectorAll(".sofr-range").forEach(function(b){b.classList.toggle("active",b.dataset.range===label);});}')
+parts.append('document.querySelectorAll(".sofr-range").forEach(function(b){b.addEventListener("click",function(){setSfrRange(b.dataset.range);});});setSfrRange("6M");')
+parts.append('var fpExp=document.querySelector(".fp-expand");if(fpExp)fpExp.addEventListener("toggle",function(){var el=document.getElementById("chart-sofr-change");if(el&&fpExp.open)Plotly.Plots.resize(el);});')
 parts.append('var vixShape={type:"line",x0:0,x1:1,xref:"paper",y0:20,y1:20,line:{color:"#ef4444",width:1,dash:"dot"}};')
 parts.append('Plotly.newPlot("chart-vix",[{x:' + j_vd + ',y:' + j_vv + ',type:"scatter",mode:"lines",')
 parts.append('  line:{color:"#f59e0b",width:2},fill:"tozeroy",fillcolor:"rgba(245,158,11,0.07)"}],')

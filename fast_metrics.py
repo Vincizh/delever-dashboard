@@ -33,6 +33,15 @@ FRB_POLICY_RATES_URL = (
     "&series=c27939ee810cb2e929a920a6bd77d9f6&lastobs=&from=&to="
     "&filetype=csv&label=include&layout=seriescolumn"
 )
+# Federal Reserve H.4.1 statistical release ("Factors Affecting Reserve Balances").
+# Table 1 carries both the weekly average of daily figures and the Wednesday level
+# for reserve balances and the U.S. Treasury General Account, so one fetch supplies
+# the live tail for WRESBAL and WTREGEN when fredgraph.csv times out from CI.
+H41_CURRENT_URL = "https://www.federalreserve.gov/releases/h41/current/h41.htm"
+# Daily Treasury Statement: operating cash balance, closing TGA balance.
+DTS_OPERATING_CASH_URL = (
+    "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/accounting/dts/operating_cash_balance"
+)
 SSGA_SPY_HOLDINGS_URL = "https://www.ssga.com/us/en/intermediary/library-content/products/fund-data/etfs/us/holdings-daily-us-en-spy.xlsx"
 TREASURY_AUCTIONS_URL = (
     "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/accounting/od/auctions_query"
@@ -562,6 +571,427 @@ def oas_metrics(series: dict[str, pd.Series], now: datetime | None = None) -> di
     return result
 
 
+# ---------------------------------------------------------------------------
+# Dollar funding pressure trio: SOFR-IORB, bank reserves, Treasury General
+# Account.  All three legs come from official sources, are evaluated with the
+# explicit user strategy overlay documented below, and fail independently: an
+# unavailable or stale leg is reported as such and can never count as
+# triggered.
+#
+# Strategy overlay (user-defined, NOT a universal empirical law):
+#   SOFR leg     : filtered non-calendar SOFR-IORB >= +3.0 bp with persistence
+#                  over the last 3 eligible (non-calendar) observations.
+#   Reserve leg  : reserves <= $2.90T AND 4-week change <= -$50B
+#                  (elevated when reserves <= $2.85T or 4-week change <= -$100B)
+#   TGA leg      : TGA >= $0.90T AND 4-week change >= +$50B
+#                  (elevated when TGA >= $1.00T or 4-week change >= +$100B)
+# ---------------------------------------------------------------------------
+SOFR_STRATEGY_BP = 3.0
+SOFR_REFERENCE_WATCH_BP = 2.0      # retained stricter analytical reference band
+SOFR_REFERENCE_ELEVATED_BP = 5.0   # retained stricter analytical reference band
+SOFR_PERSISTENCE_OBS = 3
+
+RESERVE_TRIGGER_LEVEL_T = 2.90
+RESERVE_TARGET_LEVEL_T = 2.80   # chart reference: the level the decline is heading toward
+RESERVE_ELEVATED_LEVEL_T = 2.85
+RESERVE_TRIGGER_4W_B = -50.0
+RESERVE_ELEVATED_4W_B = -100.0
+
+TGA_TRIGGER_LEVEL_T = 0.90
+TGA_ELEVATED_LEVEL_T = 1.00
+TGA_TRIGGER_4W_B = 50.0
+TGA_ELEVATED_4W_B = 100.0
+
+H41_LABELS = {
+    "reserves": "reserve balances with federal reserve banks",
+    "tga": "u.s. treasury, general account",
+}
+_H41_MONTHS = {m: i + 1 for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"])}
+
+
+def _strip_tags(fragment: str) -> str:
+    """Plain text of an HTML fragment without an XML parser dependency."""
+    import html as _html
+    import re as _re
+    text = _re.sub(r"<[^>]*>", " ", fragment)
+    text = _html.unescape(text).replace("\xa0", " ")
+    return " ".join(text.split())
+
+
+def _h41_number(cell: str) -> float | None:
+    """Parse an unsigned level cell; signed change cells return ``None``."""
+    token = cell.strip()
+    if not token or token[0] in "+-":
+        return None
+    token = token.replace(",", "")
+    try:
+        return float(token)
+    except ValueError:
+        return None
+
+
+def parse_h41_release(html: str) -> dict[str, Any]:
+    """Read reserve balances and the TGA out of the H.4.1 release page.
+
+    Returns the weekly average of daily figures (the definition FRED publishes as
+    WRESBAL / WTREGEN) dated on the week-ended Wednesday, plus the Wednesday
+    level for reference. Missing rows raise instead of returning a guess.
+    """
+    import re as _re
+    week_dates: list[date] = []
+    for month, day, year in _re.findall(
+            r"Week\s+ended\s*(?:</?[^>]*>\s*)*([A-Za-z]{3,9})\.?\s+(\d{1,2}),\s*(\d{4})",
+            _strip_tags(html) if "<" not in html else html):
+        key = str(month)[:3].lower()
+        if key in _H41_MONTHS:
+            week_dates.append(date(int(year), _H41_MONTHS[key], int(day)))
+    if not week_dates:
+        # The header can be split across cells; fall back to the plain text form.
+        text = _strip_tags(html)
+        for month, day, year in _re.findall(
+                r"Week\s+ended\s+([A-Za-z]{3,9})\.?\s+(\d{1,2}),\s*(\d{4})", text):
+            key = str(month)[:3].lower()
+            if key in _H41_MONTHS:
+                week_dates.append(date(int(year), _H41_MONTHS[key], int(day)))
+    if not week_dates:
+        raise ValueError("H.4.1 release has no 'Week ended' header date")
+    week_ended = max(week_dates)
+
+    out: dict[str, Any] = {"week_ended": week_ended.isoformat()}
+    rows = _re.split(r"<tr\b", html, flags=_re.I)
+    for key, label in H41_LABELS.items():
+        for row in rows:
+            cells = [_strip_tags(c) for c in _re.findall(
+                r"<t[dh]\b[^>]*>(.*?)</t[dh]>", row, flags=_re.I | _re.S)]
+            if not cells:
+                continue
+            first = cells[0].lower().rstrip(" .0123456789")
+            if not first.startswith(label.rstrip(" .")):
+                continue
+            numbers = [v for v in (_h41_number(c) for c in cells[1:]) if v is not None]
+            if not numbers:
+                continue
+            out[key + "_millions"] = numbers[0]
+            out[key + "_wednesday_millions"] = numbers[-1]
+            break
+        if key + "_millions" not in out:
+            raise ValueError("H.4.1 release has no parseable '" + label + "' row")
+    return out
+
+
+def load_h41_cache() -> pd.DataFrame:
+    """Committed history of parsed H.4.1 weekly observations (may be empty)."""
+    cache = FRED_CACHE_DIR / "H41_WEEKLY.csv"
+    if not cache.exists():
+        return pd.DataFrame(columns=["reserves_millions", "tga_millions"])
+    df = pd.read_csv(cache)
+    if "week_ended" not in df.columns:
+        return pd.DataFrame(columns=["reserves_millions", "tga_millions"])
+    df["week_ended"] = pd.to_datetime(df["week_ended"], errors="coerce")
+    df = df.dropna(subset=["week_ended"]).drop_duplicates("week_ended", keep="last")
+    return df.set_index("week_ended").sort_index()
+
+
+def update_h41_cache(record: dict[str, Any]) -> pd.DataFrame:
+    """Append one parsed release to the committed cache without interpolation."""
+    cache = FRED_CACHE_DIR / "H41_WEEKLY.csv"
+    df = load_h41_cache()
+    day = pd.Timestamp(record["week_ended"])
+    for column in ("reserves_millions", "tga_millions"):
+        if record.get(column) is not None:
+            df.loc[day, column] = float(record[column])
+    df = df.sort_index()
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    df.rename_axis("week_ended").to_csv(cache, date_format="%Y-%m-%d")
+    return df
+
+
+def fetch_h41_weekly(*, session=None) -> tuple[pd.Series, pd.Series, str]:
+    """Official H.4.1 reserve-balance and TGA weekly series (in $ millions).
+
+    The live release supplies the newest week; the committed cache supplies the
+    weeks already seen. Nothing is interpolated, so a week the Fed did not
+    publish stays absent rather than becoming a synthetic value.
+    """
+    source = "Federal Reserve H.4.1 cached observations"
+    try:
+        record = parse_h41_release(_get(H41_CURRENT_URL, timeout=25, retries=2, session=session).text)
+        frame = update_h41_cache(record)
+        source = "Federal Reserve H.4.1 current release"
+    except Exception as live_error:
+        frame = load_h41_cache()
+        if frame.empty:
+            raise live_error
+    reserves = pd.to_numeric(frame.get("reserves_millions"), errors="coerce").dropna() \
+        if "reserves_millions" in frame else pd.Series(dtype=float)
+    tga = pd.to_numeric(frame.get("tga_millions"), errors="coerce").dropna() \
+        if "tga_millions" in frame else pd.Series(dtype=float)
+    reserves.attrs["source"] = source
+    tga.attrs["source"] = source
+    return reserves, tga, source
+
+
+def parse_dts_operating_cash(rows: Iterable[dict[str, Any]]) -> pd.Series:
+    """Closing TGA balance from the Daily Treasury Statement, in $ millions."""
+    values: dict[pd.Timestamp, float] = {}
+    for row in rows:
+        account = str(row.get("account_type", ""))
+        if "Treasury General Account (TGA) Closing Balance" not in account:
+            continue
+        day = pd.to_datetime(row.get("record_date"), errors="coerce")
+        # The published field carrying the day's balance differs across DTS
+        # vintages, so both documented columns are accepted and "null" coerces
+        # to a skipped row instead of a zero.
+        amount = pd.to_numeric(row.get("close_today_bal"), errors="coerce")
+        if pd.isna(amount):
+            amount = pd.to_numeric(row.get("open_today_bal"), errors="coerce")
+        if pd.isna(day) or pd.isna(amount):
+            continue
+        values[day.normalize()] = float(amount)
+    if not values:
+        return pd.Series(dtype=float)
+    out = pd.Series(values).sort_index()
+    out.attrs["source"] = "Treasury Daily Treasury Statement (closing balance)"
+    return out
+
+
+def fetch_dts_tga(*, days: int = 120, session=None) -> pd.Series:
+    """Daily TGA closing balance; used only as a last-resort official fallback."""
+    start = (utc_now().date() - timedelta(days=days)).isoformat()
+    params = {
+        "fields": "record_date,account_type,close_today_bal,open_today_bal",
+        "filter": "record_date:gte:" + start,
+        "sort": "-record_date", "page[size]": 2000, "page[number]": 1,
+    }
+    payload = _get(DTS_OPERATING_CASH_URL, params=params, timeout=40, session=session).json()
+    series = parse_dts_operating_cash(payload.get("data", []))
+    if series.empty:
+        raise ValueError("Daily Treasury Statement returned no TGA closing balance")
+    return series
+
+
+def _asof_value(series: pd.Series, target: pd.Timestamp,
+                tolerance_days: int) -> tuple[float | None, pd.Timestamp | None]:
+    """Last observation on or before ``target``, or ``None`` if too far back."""
+    window = series.loc[:target]
+    if window.empty:
+        return None, None
+    day = window.index[-1]
+    if abs((target - day).days) > tolerance_days:
+        return None, None
+    return float(window.iloc[-1]), day
+
+
+def balance_metric(series_millions: pd.Series, *, cadence: str, max_age_days: int = 10,
+                   source: str | None = None, history: int = 170,
+                   now: datetime | None = None) -> dict[str, Any]:
+    """Level in $T plus 1-week / 4-week changes in $B from official observations.
+
+    Deltas use an as-of lookup against real observation dates, so a missing week
+    yields ``None`` instead of an interpolated or forward-filled change.
+    """
+    series = series_millions.dropna().sort_index() if series_millions is not None else pd.Series(dtype=float)
+    if series.empty:
+        f = freshness(None, cadence, max_age_days, now)
+        return {"available": False, "reason": "no observations", "freshness": f.__dict__,
+                "dates": [], "history": [], "source": source}
+    last_day = series.index[-1]
+    current = float(series.iloc[-1])
+    week_ago, week_day = _asof_value(series, last_day - pd.Timedelta(days=7), 5)
+    month_ago, month_day = _asof_value(series, last_day - pd.Timedelta(days=28), 7)
+    f = freshness(last_day, cadence, max_age_days, now)
+    one_week_b = None if week_ago is None else (current - week_ago) / 1e3
+    four_week_b = None if month_ago is None else (current - month_ago) / 1e3
+    tail = series.tail(history)
+    return {
+        "available": not f.stale,
+        "observation_date": last_day.strftime("%Y-%m-%d"),
+        "freshness": f.__dict__,
+        "current_millions": current,
+        "current_trillions": current / 1e6,
+        "one_week_change_b": one_week_b,
+        "four_week_change_b": four_week_b,
+        "one_week_ref_date": None if week_day is None else week_day.strftime("%Y-%m-%d"),
+        "four_week_ref_date": None if month_day is None else month_day.strftime("%Y-%m-%d"),
+        "speed_b_per_week": None if four_week_b is None else four_week_b / 4.0,
+        "source": source or str(series.attrs.get("source", "official")),
+        "dates": [d.strftime("%Y-%m-%d") for d in tail.index],
+        "history": [round(float(v) / 1e6, 5) for v in tail.values],
+    }
+
+
+def _leg_shell(name: str, label: str, metric: dict[str, Any]) -> dict[str, Any] | None:
+    if metric and metric.get("available"):
+        return None
+    fresh = (metric or {}).get("freshness", {}) or {}
+    obs = fresh.get("observation_date")
+    reason = "stale" if obs else "unavailable"
+    return {"name": name, "label": label, "available": False, "triggered": False,
+            "state": reason, "state_label": "data " + reason, "severity": "none",
+            "detail": ("Last official observation " + obs + "; a stale leg never counts as triggered."
+                       if obs else "No official observation available; leg excluded from resonance."),
+            "observation_date": obs, "freshness": fresh}
+
+
+def reserve_leg(metric: dict[str, Any]) -> dict[str, Any]:
+    """Operationalize 'reserves falling rapidly from $2.9T toward $2.8T'.
+
+    Active requires both level and speed: level <= $2.90T AND 4-week change
+    <= -$50B. Only one of the two conditions is reported as ``approaching`` so a
+    fast decline from a comfortable level cannot silently trigger the leg.
+    """
+    shell = _leg_shell("reserves", "Liquidity buffer", metric)
+    if shell is not None:
+        return shell
+    level = float(metric["current_trillions"])
+    delta = metric.get("four_week_change_b")
+    if delta is None:
+        return {"name": "reserves", "label": "Liquidity buffer", "available": False, "triggered": False,
+                "state": "incomplete", "state_label": "4-week change unavailable", "severity": "none",
+                "detail": "No observation four weeks back; the speed test cannot be evaluated.",
+                "observation_date": metric.get("observation_date"), "freshness": metric.get("freshness", {})}
+    level_ok = level <= RESERVE_TRIGGER_LEVEL_T
+    speed_ok = float(delta) <= RESERVE_TRIGGER_4W_B
+    triggered = level_ok and speed_ok
+    elevated = triggered and (level <= RESERVE_ELEVATED_LEVEL_T or float(delta) <= RESERVE_ELEVATED_4W_B)
+    if triggered:
+        state = "elevated" if elevated else "active"
+        state_label = "draining fast" if not elevated else "draining fast · elevated"
+    elif level_ok or speed_ok:
+        state, state_label = "approaching", "approaching"
+    else:
+        state, state_label = "normal", "ample"
+    detail = ("${:.3f}T vs <= ${:.2f}T ({}) · 4w {:+.0f}B vs <= {:.0f}B ({})".format(
+        level, RESERVE_TRIGGER_LEVEL_T, "met" if level_ok else "not met",
+        float(delta), RESERVE_TRIGGER_4W_B, "met" if speed_ok else "not met"))
+    return {"name": "reserves", "label": "Liquidity buffer", "available": True, "triggered": triggered,
+            "state": state, "state_label": state_label,
+            "severity": "elevated" if elevated else ("warning" if triggered else "none"),
+            "level_ok": level_ok, "speed_ok": speed_ok, "detail": detail,
+            "observation_date": metric.get("observation_date"), "freshness": metric.get("freshness", {})}
+
+
+def tga_leg(metric: dict[str, Any]) -> dict[str, Any]:
+    """Operationalize 'TGA rebuilding toward $1T'.
+
+    Active requires both level and speed: TGA >= $0.90T AND 4-week change
+    >= +$50B; elevated at >= $1.00T or 4-week change >= +$100B.
+    """
+    shell = _leg_shell("tga", "Fiscal drain", metric)
+    if shell is not None:
+        return shell
+    level = float(metric["current_trillions"])
+    delta = metric.get("four_week_change_b")
+    if delta is None:
+        return {"name": "tga", "label": "Fiscal drain", "available": False, "triggered": False,
+                "state": "incomplete", "state_label": "4-week change unavailable", "severity": "none",
+                "detail": "No observation four weeks back; the rebuild-speed test cannot be evaluated.",
+                "observation_date": metric.get("observation_date"), "freshness": metric.get("freshness", {})}
+    level_ok = level >= TGA_TRIGGER_LEVEL_T
+    speed_ok = float(delta) >= TGA_TRIGGER_4W_B
+    triggered = level_ok and speed_ok
+    elevated = triggered and (level >= TGA_ELEVATED_LEVEL_T or float(delta) >= TGA_ELEVATED_4W_B)
+    if triggered:
+        state = "elevated" if elevated else "active"
+        state_label = "rebuilding" if not elevated else "rebuilding · elevated"
+    elif level_ok or speed_ok:
+        state, state_label = "approaching", "approaching"
+    else:
+        state, state_label = "normal", "neutral"
+    detail = ("${:.3f}T vs >= ${:.2f}T ({}) · 4w {:+.0f}B vs >= {:+.0f}B ({})".format(
+        level, TGA_TRIGGER_LEVEL_T, "met" if level_ok else "not met",
+        float(delta), TGA_TRIGGER_4W_B, "met" if speed_ok else "not met"))
+    return {"name": "tga", "label": "Fiscal drain", "available": True, "triggered": triggered,
+            "state": state, "state_label": state_label,
+            "severity": "elevated" if elevated else ("warning" if triggered else "none"),
+            "level_ok": level_ok, "speed_ok": speed_ok, "detail": detail,
+            "observation_date": metric.get("observation_date"), "freshness": metric.get("freshness", {})}
+
+
+def sofr_leg(metric: dict[str, Any]) -> dict[str, Any]:
+    """Strategy-overlay SOFR leg: filtered non-calendar spread >= +3bp, persistent.
+
+    Persistence uses the last three *eligible* (non-calendar) observations, so a
+    single month-end or tax-date spike cannot activate the leg on its own.
+    """
+    shell = _leg_shell("sofr", "Funding price", metric)
+    if shell is not None:
+        return shell
+    raw = metric.get("raw_bp") or []
+    noise = metric.get("calendar_noise") or []
+    eligible = [float(v) for v, flag in zip(raw, noise) if not flag and v is not None]
+    recent = eligible[-SOFR_PERSISTENCE_OBS:]
+    persistent = len(recent) == SOFR_PERSISTENCE_OBS and all(v >= SOFR_STRATEGY_BP for v in recent)
+    reference_watch = len(recent) == SOFR_PERSISTENCE_OBS and all(v >= SOFR_REFERENCE_WATCH_BP for v in recent)
+    filtered = metric.get("filtered_5d_bp")
+    filtered_ok = filtered is not None and float(filtered) >= SOFR_STRATEGY_BP
+    triggered = bool(persistent and filtered_ok)
+    if triggered:
+        state = "elevated" if (filtered is not None and float(filtered) >= SOFR_REFERENCE_ELEVATED_BP) else "active"
+        state_label = "above +3bp, persistent" if state == "active" else "above +5bp reference band"
+    elif filtered_ok or persistent or reference_watch:
+        state, state_label = "approaching", "approaching"
+    else:
+        state, state_label = "normal", "at or below IORB"
+    detail = ("filtered median {} vs >= +{:.0f}bp ({}) · last {} non-calendar readings {} +{:.0f}bp ({})".format(
+        "n/a" if filtered is None else "{:+.1f}bp".format(float(filtered)),
+        SOFR_STRATEGY_BP, "met" if filtered_ok else "not met", SOFR_PERSISTENCE_OBS,
+        "all >=" if persistent else "not all >=", SOFR_STRATEGY_BP, "met" if persistent else "not met"))
+    return {"name": "sofr", "label": "Funding price", "available": True, "triggered": triggered,
+            "state": state, "state_label": state_label,
+            "severity": "elevated" if state == "elevated" else ("warning" if triggered else "none"),
+            "persistent": persistent, "filtered_ok": filtered_ok,
+            "reference_watch": reference_watch,
+            "eligible_recent_bp": [round(v, 2) for v in recent], "detail": detail,
+            "calendar_latest": bool(noise[-1]) if noise else False,
+            "observation_date": metric.get("observation_date"), "freshness": metric.get("freshness", {})}
+
+
+RESONANCE_STATES = {
+    0: ("normal", "No resonance", "无共振",
+        "None of the three strategy conditions is active; dollar funding looks orderly."),
+    1: ("watch", "Watch", "观察",
+        "One leg is active. Single-leg pressure is common and is not a fragility signal on its own."),
+    2: ("warning", "Yellow warning", "黄色预警",
+        "Two legs are active: funding pressure is building. Treat as a fragility warning, not a forecast."),
+    3: ("structural-top-risk", "Structural-top risk signal", "结构性顶部风险",
+        "All three legs are active. This is fragility confirmation under the user's strategy overlay, "
+        "not a deterministic market-top prediction."),
+}
+
+
+def funding_resonance(legs: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """Combine the three legs into a 0/3 - 3/3 resonance state.
+
+    A leg that is stale, unavailable, or missing its 4-week comparison is never
+    counted as triggered, and its absence is reported as an incomplete-data
+    state so a partial fetch cannot look like confirmation.
+    """
+    ordered = list(legs)
+    active = [leg for leg in ordered if leg.get("available") and leg.get("triggered")]
+    missing = [leg for leg in ordered if not leg.get("available")]
+    count = len(active)
+    key, headline, headline_cn, interpretation = RESONANCE_STATES[min(count, 3)]
+    if count == 1:
+        interpretation = ("Only " + active[0]["label"].lower() + " (" + active[0]["name"].upper()
+                          + ") is active. " + RESONANCE_STATES[1][3])
+    detail = interpretation
+    if missing:
+        names = ", ".join(leg["name"].upper() for leg in missing)
+        detail = ("Incomplete data: " + names + " unavailable or stale, so at most "
+                  + str(len(ordered) - len(missing)) + " of 3 legs can be evaluated. " + interpretation)
+    return {
+        "state": key, "headline": headline, "headline_cn": headline_cn,
+        "active_count": count, "total": len(ordered),
+        "summary": "{}/{} conditions active".format(count, len(ordered)),
+        "interpretation": detail, "incomplete": bool(missing),
+        "active_legs": [leg["name"] for leg in active],
+        "unavailable_legs": [leg["name"] for leg in missing],
+        "legs": {leg["name"]: leg for leg in ordered},
+    }
+
+
 def fetch_treasury_settlements(*, session=None) -> set[date]:
     params = {
         "fields": "issue_date,offering_amt",
@@ -587,13 +1017,79 @@ def fetch_fast_metrics(snapshot_path: str | Path, now: datetime | None = None) -
         out["vix"] = {"available": False, "reason": str(exc), "freshness": freshness(None, "daily business day", 4, current).__dict__}
         out["errors"]["vix"] = str(exc)
 
-    # Reserves / GDP.
+    # Official weekly H.4.1 balances (reserve balances + Treasury General Account).
+    # The Fed's own release is fetched first because fredgraph.csv times out from
+    # CI runners; the committed H41_WEEKLY.csv keeps the weeks already observed.
+    h41_reserves = h41_tga = None
+    h41_source = None
     try:
-        out["reserves"] = reserves_gdp(fetch_fred_series("WRESBAL", "2018-01-01", session=session),
+        h41_reserves, h41_tga, h41_source = fetch_h41_weekly(session=session)
+    except Exception as exc:
+        out["errors"]["h41"] = str(exc)
+    fred_reserves = None
+    try:
+        fred_reserves = fetch_fred_series("WRESBAL", "2018-01-01", session=session)
+    except Exception as exc:
+        out["errors"]["reserves_fred"] = str(exc)
+    fred_tga = None
+    try:
+        fred_tga = fetch_fred_series("WTREGEN", "2018-01-01", session=session)
+    except Exception as exc:
+        out["errors"]["tga_fred"] = str(exc)
+    reserves_series = splice_official(fred_reserves, h41_reserves)
+    tga_series = splice_official(fred_tga, h41_tga)
+
+    def _src(fred_series, label):
+        parts = []
+        if fred_series is not None and not fred_series.empty:
+            parts.append("FRED " + label + " (" + str(fred_series.attrs.get("source", "FRED")) + ")")
+        if h41_source:
+            parts.append(h41_source)
+        return " + ".join(parts) if parts else "unavailable"
+
+    # Reserves / GDP — normalized structural context, kept unchanged.
+    try:
+        if reserves_series.empty:
+            raise ValueError("no official reserve-balance observations available")
+        out["reserves"] = reserves_gdp(reserves_series,
                                         fetch_fred_series("GDP", "2018-01-01", session=session), current)
     except Exception as exc:
         out["reserves"] = {"available": False, "freshness": freshness(None, "weekly", 10, current).__dict__}
         out["errors"]["reserves"] = str(exc)
+
+    # Reserve balances in levels (funding-pressure leg B).
+    try:
+        out["reserves_level"] = balance_metric(
+            reserves_series, cadence="weekly (H.4.1, week ended Wednesday)",
+            source=_src(fred_reserves, "WRESBAL"), now=current)
+    except Exception as exc:
+        out["reserves_level"] = {"available": False, "dates": [], "history": [],
+                                 "freshness": freshness(None, "weekly", 10, current).__dict__}
+        out["errors"]["reserves_level"] = str(exc)
+
+    # Treasury General Account in levels (funding-pressure leg C).  If the weekly
+    # path is stale, the Daily Treasury Statement supplies an official daily tail
+    # rather than a forward-filled weekly value.
+    try:
+        tga_metric = balance_metric(tga_series, cadence="weekly (H.4.1, week ended Wednesday)",
+                                    source=_src(fred_tga, "WTREGEN"), now=current)
+        if not tga_metric.get("available"):
+            try:
+                dts = fetch_dts_tga(session=session)
+                fallback = balance_metric(
+                    splice_official(tga_series, dts),
+                    cadence="weekly H.4.1 spliced with daily DTS closing balance",
+                    source=_src(fred_tga, "WTREGEN") + " + Treasury DTS closing balance", now=current)
+                if fallback.get("available"):
+                    fallback["mixed_cadence"] = True
+                    tga_metric = fallback
+            except Exception as dts_exc:
+                out["errors"]["tga_dts"] = str(dts_exc)
+        out["tga_level"] = tga_metric
+    except Exception as exc:
+        out["tga_level"] = {"available": False, "dates": [], "history": [],
+                            "freshness": freshness(None, "weekly", 10, current).__dict__}
+        out["errors"]["tga_level"] = str(exc)
 
     # SOFR / IORB, p99, and NY Fed repo operations.
     nyfed_sofr = pd.DataFrame(columns=["median", "p99"])
@@ -680,6 +1176,22 @@ def fetch_fast_metrics(snapshot_path: str | Path, now: datetime | None = None) -
     except Exception as tail_exc:
         out["sofr_tail"] = {"available": False, "freshness": freshness(None, "daily business day", 4, current).__dict__}
         out["errors"]["sofr_tail"] = str(tail_exc)
+
+    # Three-leg dollar funding resonance.  Built after the SOFR block so every
+    # leg is evaluated from its own already-isolated metric.
+    try:
+        out["funding"] = funding_resonance([
+            sofr_leg(out.get("sofr_iorb", {})),
+            reserve_leg(out.get("reserves_level", {})),
+            tga_leg(out.get("tga_level", {})),
+        ])
+    except Exception as exc:
+        out["funding"] = {"state": "unavailable", "headline": "Data unavailable", "headline_cn": "数据不可用",
+                          "active_count": 0, "total": 3, "summary": "0/3 conditions active",
+                          "interpretation": "Funding resonance could not be evaluated.",
+                          "incomplete": True, "active_legs": [], "unavailable_legs": ["sofr", "reserves", "tga"],
+                          "legs": {}}
+        out["errors"]["funding"] = str(exc)
 
     try:
         repo = parse_repo_operations(_get(NYFED_REPO_URL, session=session).json())

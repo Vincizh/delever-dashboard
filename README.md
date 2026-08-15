@@ -17,7 +17,7 @@ The dashboard is deterministic and refreshes hourly through GitHub Actions. A mi
 | L1 | Liquidity Pressure Index | Causal weekly percentiles of short rate, coupon supply, net liquidity and VIX | FRED, FiscalData, Cboe/Yahoo market history; weekly / daily inputs |
 | L1 | Reserves / GDP | `WRESBAL / (GDP × 1,000)` with a rolling 156-week percentile; warning/elevated requires two weekly observations | [FRED WRESBAL](https://fred.stlouisfed.org/graph/fredgraph.csv?id=WRESBAL), [FRED GDP](https://fred.stlouisfed.org/graph/fredgraph.csv?id=GDP) |
 | L1 | NY Fed repo accepted | Daily accepted amount and trailing 7-calendar-day sum; persistence / own-history percentile, not a dollar threshold | [NY Fed Markets API](https://markets.newyorkfed.org/api/rp/repo/all/results/last/40.json) |
-| L1 | SOFR − IORB | Raw daily spread and a five-observation median of non-calendar readings; calendar-filtered structural watch/elevated logic | [FRED SOFR](https://fred.stlouisfed.org/graph/fredgraph.csv?id=SOFR), [FRED IORB](https://fred.stlouisfed.org/graph/fredgraph.csv?id=IORB), [Treasury auction data](https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/accounting/od/auctions_query) |
+| L1 | Dollar Funding Pressure (SOFR − IORB · reserves · TGA) | Three-leg strategy overlay: funding price, liquidity buffer, fiscal drain, combined into a 0/3–3/3 resonance state | [NY Fed SOFR](https://markets.newyorkfed.org/api/rates/secured/sofr/last/15.json), [FRB PRATES IORB](https://www.federalreserve.gov/datadownload/Choose.aspx?rel=PRATES), [Federal Reserve H.4.1](https://www.federalreserve.gov/releases/h41/current/h41.htm), [FRED WRESBAL](https://fred.stlouisfed.org/series/WRESBAL), [FRED WTREGEN](https://fred.stlouisfed.org/series/WTREGEN), [Treasury DTS](https://fiscaldata.treasury.gov/datasets/daily-treasury-statement/operating-cash-balance) |
 | L1 | SOFR p99 − median | NY Fed published 99th percentile less the published median SOFR | [NY Fed SOFR API](https://markets.newyorkfed.org/api/rates/secured/sofr/last/15.json) |
 | L2 | CFTC positioning and basis proxy | Leveraged-fund / managed-money net positions, percentiles, and a 2y/5y/10y basis-trade proxy | [CFTC public reporting API](https://publicreporting.cftc.gov/) · weekly |
 | L2 | S&P 500 concentration | Sum of the largest 10 and 5 weights in SPY's official holdings file; local daily snapshots begin the history | [SSGA SPY holdings](https://www.ssga.com/us/en/intermediary/library-content/products/fund-data/etfs/us/holdings-daily-us-en-spy.xlsx) |
@@ -35,17 +35,39 @@ The dashboard **does not use Yahoo `^VIX3M`**. It uses Cboe's official daily-his
 
 ### Reserves are relative, not fixed dollar thresholds
 
-The dashboard does not use `$2.8T` or `$2.5T` reserve triggers. Its signal is reserves/GDP and the causal 3-year (156-week) percentile: below the 20th percentile for two weekly observations is a warning; below the 10th for two is elevated. The raw reserve dollar value remains context only.
+The **normalized structural metric** is unchanged: reserves/GDP with a causal 3-year (156-week) percentile — below the 20th percentile for two weekly observations is a warning, below the 10th for two is elevated. The `$2.90T` / `$2.80T` dollar levels appear only inside the Dollar Funding Pressure section, where they are labeled as the operator's strategy overlay rather than an empirical law, and they do not feed the reserves/GDP percentile logic.
+
+### Dollar Funding Pressure: one section, three legs
+
+`SOFR − IORB`, **bank reserve balances** and the **Treasury General Account** are consolidated into a single Layer 1 section (`#funding-pressure`) with three aligned small-multiple charts on one shared x-axis and one shared 3M/6M/1Y/3Y range control. There is no separate SOFR-IORB panel any more, and no dual/triple-axis overlay.
+
+The absolute trigger levels below are an explicit **user-defined strategy overlay**, not a universal empirical law, and the dashboard says so on the page. The three-leg state is a *fragility confirmation*, never a deterministic market-top prediction.
+
+| Leg | Card | Active (counts toward resonance) | Elevated |
+|---|---|---|---|
+| A. Funding price | `SOFR − IORB` in bp | filtered non-calendar 5-observation median ≥ `+3bp` **and** the last 3 non-calendar observations all ≥ `+3bp` | filtered median ≥ `+5bp` |
+| B. Liquidity buffer | reserve balances, `$T` | level ≤ `$2.90T` **and** 4-week change ≤ `−$50B` | level ≤ `$2.85T` or 4-week change ≤ `−$100B` |
+| C. Fiscal drain | TGA, `$T` | level ≥ `$0.90T` **and** 4-week change ≥ `+$50B` | level ≥ `$1.00T` or 4-week change ≥ `+$100B` |
+
+Only one of the two conditions met shows as **approaching** and does *not* count. Resonance: `0/3` no resonance · `1/3` watch (the named leg only) · `2/3` yellow warning, funding pressure building · `3/3` structural-top risk signal. A stale, unavailable, or 4-week-incomplete leg can never count as triggered; the header then shows an incomplete-data state.
+
+Causality is stated on the page as a three-node path: a rebuilding TGA drains bank reserves one-for-one, and a thinner reserve buffer makes secured overnight funding price above IORB.
 
 ### SOFR − IORB is calendar-filtered
 
-Month-end, quarter-end, major US corporate estimated-tax dates (April/June/September/December 15, adjusted to business days), and large Treasury settlement dates derived from [Treasury auction issue dates](https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/accounting/od/auctions_query) are labeled as calendar noise. A “large” settlement is an official auction issue date with at least `$30B` offered. They are displayed but cannot trigger a structural alert.
+Month-end, quarter-end, major US corporate estimated-tax dates (April/June/September/December 15, adjusted to business days), and large Treasury settlement dates derived from [Treasury auction issue dates](https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/accounting/od/auctions_query) are labeled as calendar noise. A “large” settlement is an official auction issue date with at least `$30B` offered. They are displayed as hollow markers but cannot trigger a structural alert or the strategy leg.
 
-* **Structural watch:** three consecutive non-calendar observations at or above `+2bp`.
-* **Elevated:** a non-calendar observation at or above `+5bp`.
+* **Strategy threshold (visually primary):** `+3bp`, with the 3-observation persistence rule above.
+* **Analytical reference bands (kept, muted):** structural watch at three consecutive non-calendar observations ≥ `+2bp`; elevated ≥ `+5bp`. These are this dashboard's own persistence-based bands and are intentionally stricter/different from the operator's `+3bp` line.
 * The emphasized series is a five-observation median of non-calendar readings.
 
 Positive SOFR − IORB means secured overnight funding trades above the Fed's administered reserve rate. It is a stress confirmation signal — especially with repo use and SOFR-tail widening — not a stand-alone market-top predictor.
+
+### Reserves and TGA are fetched from official releases, spliced, never interpolated
+
+Both series are read first from the [Federal Reserve H.4.1 release](https://www.federalreserve.gov/releases/h41/current/h41.htm) (Table 1, *Reserve balances with Federal Reserve Banks* and *U.S. Treasury, General Account*, weekly average of daily figures for the week ended Wednesday — the same definition FRED publishes as `WRESBAL` / `WTREGEN`), then from FRED, then from the local versioned cache; the live/preferred tail wins on overlap and nothing is interpolated or forward-filled. `data/fred-cache/H41_WEEKLY.csv` accumulates each parsed release so a fredgraph outage from CI cannot blank the legs. The Daily Treasury Statement operating-cash endpoint is an official daily fallback tail for the TGA only. Each source is fetched in its own isolated try/except, so one failure cannot blank the other two legs.
+
+Reserves/GDP with its rolling 156-week percentile remains a **separate** normalized structural metric; the strategy overlay's dollar levels do not replace it.
 
 ### Freshness and fallback
 

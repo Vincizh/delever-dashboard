@@ -35,14 +35,18 @@ jobs:
         env:
           FLASHALPHA_API_KEY: ${{ secrets.FLASHALPHA_API_KEY }}
 
-      # Browser-level gate on the deployment-style static artifact: the SOFR-IORB
-      # panel must render a sized chart with visible series, current KPI values,
-      # and working range controls before anything is pushed to Pages.
+      # Browser-level gate on the deployment-style static artifact: the three
+      # Dollar Funding Pressure cards must show real values, all three aligned
+      # chart panels must render with finite series, the range controls must
+      # drive every panel, and mobile must not overflow before anything is
+      # pushed to Pages.  The degraded run then blanks one leg's series and
+      # asserts the other two panels survive.
       - name: Browser regression check
         run: |
           npm install --no-save playwright@1.55.0
           npx playwright install --with-deps chromium
           node test_dashboard_browser.mjs index.html
+          node test_dashboard_degraded.mjs index.html
 
       - name: Commit and push updated index.html
         run: |
